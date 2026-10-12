@@ -1,8 +1,11 @@
 """Sequoia-X V2 主程序入口。
 
-两种运行模式：
-  python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
-  python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
+两种运行模式（具体用哪个数据源由 .env 里的 DATA_SOURCE 决定）：
+  python main.py               # 日常模式：增量补当天数据 + 跑策略 + 飞书推送（2~5分钟）
+  python main.py --backfill    # 回填模式：拉全市场历史K线（首次/补数据用，akshare 约40分钟）
+
+数据源：
+  baostock = 项目原设计；akshare = 东方财富（本机当前使用，见 README/使用说明第六节）
 """
 
 import argparse
@@ -34,7 +37,7 @@ def main() -> None:
     parser.add_argument(
         "--backfill",
         action="store_true",
-        help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+        help="回填模式：拉取全市场历史 K 线（数据源由 DATA_SOURCE 决定）",
     )
     args = parser.parse_args()
 
