@@ -47,6 +47,7 @@ DATA_DIR = REPO / "data"
 LOGS_DIR = REPO / "logs"
 SIGNALS_CACHE = DATA_DIR / "signals_cache.json"
 NAME_CACHE = DATA_DIR / "name_cache.json"
+JOBS_FILE = DATA_DIR / "jobs_history.json"
 
 HOST = os.environ.get("WEBUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("WEBUI_PORT", "8899"))
@@ -592,12 +593,65 @@ def _target_loggers() -> list[logging.Logger]:
 
 
 class JobManager:
+    """后台任务管理器。任务历史持久化到 data/jobs_history.json，
+    这样重启工作台后「历史任务」还在（不然这个面板一重启就空了）。"""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._counter = 0
         self._running: str | None = None
+        self._load()
+
+    # ── 持久化 ──
+
+    def _load(self) -> None:
+        if not JOBS_FILE.exists():
+            return
+        try:
+            payload = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"读取任务历史失败（忽略）：{exc}")
+            return
+        for rec in payload.get("jobs", []):
+            try:
+                job = Job(rec["id"], rec.get("kind", "?"))
+                job.status = rec.get("status", "done")
+                job.started = rec.get("started", "")
+                job.ended = rec.get("ended")
+                job.exit = rec.get("exit")
+                job.error = rec.get("error")
+                job.progress = rec.get("progress") or job.progress
+                job.log = list(rec.get("log") or [])
+                if job.status == "running":
+                    # 上次工作台是被直接关掉的，那个任务已经不在跑了
+                    job.status = "failed"
+                    job.error = "工作台重启，任务被中断"
+                    job.ended = job.ended or now_str()
+                    job.exit = 1
+                    job.progress = dict(job.progress, text="已中断")
+                self._jobs[job.id] = job
+                self._order.append(job.id)
+            except Exception:  # noqa: BLE001
+                continue
+        self._counter = len(self._order)
+        if self._order:
+            log.info(f"载入 {len(self._order)} 条历史任务记录")
+
+    def _save(self) -> None:
+        try:
+            with self._lock:
+                recs = [self._jobs[i].snapshot(log_lines=200) for i in self._order[-50:]]
+            JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            JOBS_FILE.write_text(
+                json.dumps({"jobs": recs}, ensure_ascii=False, default=_json_default),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"保存任务历史失败（忽略）：{exc}")
+
+    # ── 查询 ──
 
     def list(self) -> list[dict]:
         with self._lock:
@@ -620,6 +674,7 @@ class JobManager:
             self._jobs[job_id] = job
             self._order.append(job_id)
             self._running = job_id
+        self._save()
         threading.Thread(target=self._run, args=(job, kind), daemon=True).start()
         return job
 
@@ -660,6 +715,7 @@ class JobManager:
                     pass
             with self._lock:
                 self._running = None
+            self._save()
 
     # ── 三种任务 ──
 
