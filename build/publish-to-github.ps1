@@ -51,7 +51,13 @@ function Head($m) { Write-Host ""; Write-Host "===== $m =====" -ForegroundColor 
 function Say($m)  { Write-Host "  $m" }
 function Ok($m)   { Write-Host "  ✓ $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "  ⚠ $m" -ForegroundColor Yellow }
-function Die($m)  { Write-Host ""; Write-Host "✗ $m" -ForegroundColor Red; exit 1 }
+# 退出前一定要把 ghproxy 规则恢复回去（Die 用的是 exit，不会走 trap/finally）
+function Die($m)  {
+    if (Get-Command Restore-GhproxyRule -EA SilentlyContinue) { Restore-GhproxyRule }
+    Write-Host ""
+    Write-Host "✗ $m" -ForegroundColor Red
+    exit 1
+}
 
 $RepoDir = $Workspace   # 脚本在 <仓库>\build 下，所以 Workspace 就是仓库本身
 if (-not (Test-Path $RepoDir)) { Die "找不到仓库目录：$RepoDir" }
@@ -59,6 +65,22 @@ $Git = (Get-Command git -EA SilentlyContinue).Source
 if (-not $Git) { $Git = "$env:LOCALAPPDATA\Programs\sequoia-tools\mingit\cmd\git.exe" }
 if (-not (Test-Path $Git)) { Die "找不到 git" }
 if (-not $SetupExe) { $SetupExe = Join-Path $RepoDir "installer\dist\Sequoia-X-Setup.exe" }
+
+# ── ghproxy 规则的摘除与恢复 ──
+# 这台机器的全局 git 配置会把 github.com 重写成 ghproxy.net；带着这条规则 push，
+# token 就会被发给那个第三方代理。所以推送前必须摘掉、之后恢复。
+# ⚠️ Die 走的是 exit，不会触发 trap/finally，所以恢复动作必须显式写进 Die 里——
+#    第一次跑的时候就因为改名 403 退出，把这条规则留在了「已摘除」状态。
+$script:GhproxyRule = "url.https://ghproxy.net/https://github.com/.insteadof"
+$script:GhproxyPrev = @()
+$script:GhproxyRemoved = $false
+
+function Restore-GhproxyRule {
+    if (-not $script:GhproxyRemoved) { return }
+    foreach ($v in $script:GhproxyPrev) { & $Git config --global --add $script:GhproxyRule $v }
+    $script:GhproxyRemoved = $false
+    Write-Host "  ✓ 已恢复 ghproxy 重写规则" -ForegroundColor DarkGray
+}
 
 # ══════════════════════════════════════════════════════════════════
 #  0. 读 token
@@ -107,19 +129,26 @@ Ok "提交署名将用：$Owner <$Noreply>"
 #  2. 处理 ghproxy 重写规则（关键安全步骤）
 # ══════════════════════════════════════════════════════════════════
 Head "2/7 检查 git 的 URL 重写规则"
-$RuleKey = "url.https://ghproxy.net/https://github.com/.insteadof"
-$prevValues = @(& $Git config --global --get-all $RuleKey 2>$null)
-if ($prevValues.Count -gt 0 -and $prevValues[0]) {
-    Warn "发现重写规则：$RuleKey = $($prevValues -join ', ')"
+$script:GhproxyPrev = @(& $Git config --global --get-all $script:GhproxyRule 2>$null)
+if ($script:GhproxyPrev.Count -gt 0 -and $script:GhproxyPrev[0]) {
+    Warn "发现重写规则：$($script:GhproxyRule) = $($script:GhproxyPrev -join ', ')"
     Warn "如果不摘掉，push 时会把 token 发给 ghproxy.net 这个第三方代理"
     if (-not $DryRun) {
-        & $Git config --global --unset-all $RuleKey
+        & $Git config --global --unset-all $script:GhproxyRule
+        $script:GhproxyRemoved = $true
         Ok "已临时摘掉（推送结束后会原样恢复）"
     } else {
         Say "（DryRun：不会真的摘掉）"
     }
 } else {
     Ok "没有 ghproxy 重写规则"
+}
+
+# 后面任何一步抛错（终止性异常）也要把规则恢复回去。
+# 注意 Die 用的是 exit，不走这里，所以 Die 自己也调了 Restore-GhproxyRule。
+trap {
+    Restore-GhproxyRule
+    exit 1
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -171,10 +200,21 @@ if ($target) {
     Say "把 Sequoia-X 改名为 $RepoName …"
     if ($DryRun) { Say "（DryRun：跳过）" }
     else {
-        $body = @{ name = $RepoName } | ConvertTo-Json
-        $renamed = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/Sequoia-X" `
-            -Method Patch -Headers $Headers -Body $body -ContentType "application/json" -TimeoutSec 60
-        Ok "已改名：$($renamed.full_name)（fork=$($renamed.fork)，parent=$($renamed.parent.full_name)）"
+        try {
+            $body = @{ name = $RepoName } | ConvertTo-Json
+            $renamed = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/Sequoia-X" `
+                -Method Patch -Headers $Headers -Body $body -ContentType "application/json" -TimeoutSec 60
+            Ok "已改名：$($renamed.full_name)（fork=$($renamed.fork)，parent=$($renamed.parent.full_name)）"
+        } catch {
+            # fine-grained token 没有 Administration 权限时会 403。
+            # 改名纯属美观问题，不该因此中断整个发布——继续用现有的仓库名。
+            Warn "改名失败：$($_.Exception.Message)"
+            Warn "（fine-grained token 需要「Administration: Read and write」才能改名）"
+            Warn "先按现有名字 ***** 发布，你之后可以在 GitHub 网页上手动改名："
+            Warn "    Settings → General → Repository name → 改成 $RepoName"
+            Warn "    改名不影响 fork 关系，Release 和附件都会跟着走（旧链接自动跳转）"
+            $RepoName = "Sequoia-X"
+        }
     }
 }
 
@@ -301,9 +341,8 @@ Sequoia-X-Setup.exe /S /D="D:\Apps\Sequoia-X" [/NoData] [/NoDesktop] [/NoStartMe
 #  6. 恢复 ghproxy 规则
 # ══════════════════════════════════════════════════════════════════
 Head "6/7 恢复 git 配置"
-if ($prevValues.Count -gt 0 -and $prevValues[0] -and -not $DryRun) {
-    foreach ($v in $prevValues) { & $Git config --global --add $RuleKey $v }
-    Ok "已恢复 ghproxy 重写规则"
+if ($script:GhproxyRemoved -and -not $DryRun) {
+    Restore-GhproxyRule
 } else {
     Say "无需恢复"
 }
