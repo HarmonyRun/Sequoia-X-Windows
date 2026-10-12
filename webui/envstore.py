@@ -50,6 +50,7 @@ def _strategy_items() -> list[dict]:
             "label": f"{label} · 专属 Webhook",
             "type": "password",
             "secret": True,
+            "url": True,
             "required": False,
             "placeholder": "留空 = 使用主 Webhook",
             "help": f"只想把「{label}」的信号推到另一个飞书群时填这里，留空走主通道。",
@@ -70,6 +71,7 @@ GROUPS: list[dict] = [
                 "label": "主 Webhook 地址",
                 "type": "password",
                 "secret": True,
+                "url": True,
                 "required": True,
                 "placeholder": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
                 "help": "飞书群 → 设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址。"
@@ -162,6 +164,62 @@ GROUPS: list[dict] = [
                 "default": "data/sequoia_v2.db",
                 "help": "相对于项目根目录。改成一个新路径等于换一个数据库——"
                         "新库里没有任何历史数据，需要重新回填。",
+            },
+        ],
+    },
+    {
+        "key": "llm",
+        "title": "大模型分析（可选）",
+        "desc": "开启后，每次跑完选股会把「当天的市场情况 + 各策略选出的股票」交给大模型分析，"
+                "分析结果自动推送到飞书。用的是 OpenAI 兼容接口，"
+                "DeepSeek / 通义 / 智谱 / Moonshot / 本地 Ollama 都能接。",
+        "items": [
+            {
+                "key": "LLM_ENABLED",
+                "label": "启用大模型分析",
+                "type": "select",
+                "required": True,
+                "default": "0",
+                "choices": [
+                    {"value": "0", "label": "关闭（不分析、不推送）"},
+                    {"value": "1", "label": "开启"},
+                ],
+                "help": "开启后每天自动选股跑完会多推一条「AI 分析」卡片到飞书。"
+                        "下面三项没填齐的话不会分析，只会在日志里提示。",
+            },
+            {
+                "key": "LLM_BASE_URL",
+                "label": "接口地址（Base URL）",
+                "type": "text",
+                "required": False,
+                "default": "",
+                "placeholder": "https://api.deepseek.com/v1",
+                "help": "填到 /v1 为止即可，程序会自动补 /chat/completions。"
+                        "常见值：DeepSeek → https://api.deepseek.com/v1 ；"
+                        "通义千问 → https://dashscope.aliyuncs.com/compatible-mode/v1 ；"
+                        "本地 Ollama → http://localhost:11434/v1",
+            },
+            {
+                "key": "LLM_MODEL",
+                "label": "模型名",
+                "type": "text",
+                "required": False,
+                "default": "",
+                "placeholder": "deepseek-chat",
+                "help": "要和服务商文档里的名字完全一致，例如 deepseek-chat、"
+                        "qwen-plus、glm-4-plus、gpt-4o-mini。本地 Ollama 就是 "
+                        "ollama list 里那个名字。",
+            },
+            {
+                "key": "LLM_API_KEY",
+                "label": "API Key",
+                "type": "password",
+                "secret": True,
+                "required": False,
+                "default": "",
+                "placeholder": "sk-…",
+                "help": "本地 Ollama 不需要鉴权，留空即可。填完建议点右上角「测试大模型」验证一下——"
+                        "地址或模型名写错不会报错，只会静默分析不出来。",
             },
         ],
     },
@@ -388,9 +446,12 @@ def validate_one(key: str, raw) -> tuple[str, list[str]]:
             raise SettingError(f"「{label}」只能是：{' / '.join(allowed)}")
 
     elif kind in ("text", "password"):
-        if value and not value.startswith(("http://", "https://")) and item.get("secret"):
+        # 只有明确标了 url 的字段才校验「必须是网址」。
+        # 早先是「secret 字段一律当网址」，结果加 API Key 时会被误伤——
+        # sk-xxxx 当然不是 http 开头。
+        if value and item.get("url") and not value.startswith(("http://", "https://")):
             raise SettingError(f"「{label}」必须是以 http:// 或 https:// 开头的地址")
-        if value and item.get("secret") and "open.feishu.cn" not in value:
+        if value and item.get("url") and "open.feishu.cn" not in value:
             warnings.append(
                 f"「{label}」不是 open.feishu.cn 域名，除非你确实在用自建代理，否则推送会失败"
             )
@@ -428,7 +489,63 @@ def validate(updates: dict) -> tuple[dict[str, str], list[str]]:
         value, warns = validate_one(key, raw)
         normalized[key] = value
         warnings.extend(warns)
+
+    _validate_llm_combined(normalized)
     return normalized, warnings
+
+
+def _validate_llm_combined(updates: dict[str, str]) -> None:
+    """跨字段校验：开启大模型分析就必须把地址和模型名填齐。
+
+    单字段校验做不到这件事——「地址为空」在没开启时是合法的。所以要把
+    「已保存的值 + 本次改动」合并起来看。
+    """
+    env = read_env()
+    merged: dict[str, str] = {}
+    for key in ("LLM_ENABLED", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"):
+        if key in updates:
+            merged[key] = updates[key]
+        else:
+            spec = _SPEC_BY_KEY.get(key)
+            value, _ = current_value(spec[1], env) if spec else ("", False)
+            merged[key] = value
+
+    enabled = merged.get("LLM_ENABLED", "0") in ("1", "true", "True", "on")
+    if not enabled:
+        return
+
+    missing = []
+    if not merged.get("LLM_BASE_URL", "").strip():
+        missing.append("接口地址")
+    if not merged.get("LLM_MODEL", "").strip():
+        missing.append("模型名")
+    if missing:
+        raise SettingError(
+            "开启了「大模型分析」，但还没填：" + "、".join(missing)
+            + "（不想用大模型就把「启用大模型分析」改回关闭）"
+        )
+
+
+def llm_from(body: dict) -> dict:
+    """从请求体里取「测试大模型」要用的参数。
+
+    优先用请求里直接给的（这样可以先测试再保存），缺的用已保存的值兜底。
+    """
+    env = read_env()
+    out = {}
+    for key, field in (
+        ("LLM_BASE_URL", "base_url"),
+        ("LLM_MODEL", "model"),
+        ("LLM_API_KEY", "api_key"),
+    ):
+        raw = body.get(field)
+        if raw is not None and str(raw).strip():
+            out[field] = str(raw).strip()
+        else:
+            spec = _SPEC_BY_KEY.get(key)
+            value, _ = current_value(spec[1], env) if spec else ("", False)
+            out[field] = value
+    return out
 
 
 def resolve_webhook(body: dict) -> str:

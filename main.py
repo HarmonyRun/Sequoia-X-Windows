@@ -24,7 +24,7 @@ socket.setdefaulttimeout(10.0)
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
-from sequoia_x.pipeline import run_strategies
+from sequoia_x.pipeline import run_daily
 
 
 def main() -> None:
@@ -60,8 +60,9 @@ def main() -> None:
         count = engine.sync_today_bulk()
         logger.info(f"增量同步完成，新增 {count} 行")
 
-        # 4/5. 策略列表与执行都在 sequoia_x.pipeline 里（命令行与 Web 工作台共用）
-        run_strategies(engine, settings, push=True)
+        # 4/5. 策略列表、执行、以及（可选）大模型分析都在 sequoia_x.pipeline 里
+        #      （命令行与 Web 工作台共用同一条流程）
+        run_daily(engine, settings, push=True)
 
     except Exception:
         try:

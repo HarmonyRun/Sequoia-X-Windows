@@ -126,3 +126,68 @@ def run_strategies(
             logger.info(f"{name} 无选股结果，跳过推送")
 
     return results
+
+
+def run_daily(
+    engine: DataEngine,
+    settings: Settings,
+    push: bool = True,
+    on_strategy=None,
+    analyze: bool = True,
+) -> dict:
+    """日常流程：跑策略 →（可选）大模型分析 → 推送分析。
+
+    命令行（main.py）和 Web 工作台的「运行日常选股」都走这里，
+    保证两边行为完全一致——尤其是「分析结果推送」这一步不能只在一边有。
+
+    Args:
+        push: 是否推送选股卡片。
+        analyze: 是否做大模型分析（还要看 ``settings.llm_enabled``）。
+
+    Returns:
+        ``{"results": [...], "analysis": str|None, "analysis_pushed": bool}``
+    """
+    results = run_strategies(engine, settings, push=push, on_strategy=on_strategy)
+
+    out = {"results": results, "analysis": None, "analysis_pushed": False}
+    if not analyze:
+        return out
+
+    # 大模型分析是附加价值：任何失败都只记日志，不能影响已经算出来的选股结果
+    try:
+        from sequoia_x.analyze.llm import analyze_daily, to_lark_md
+
+        text = analyze_daily(engine, settings, results, labels=STRATEGY_LABELS)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(f"大模型分析异常：{exc}")
+        return out
+
+    if not text:
+        return out
+    out["analysis"] = text
+
+    from sequoia_x.notify.feishu import FeishuNotifier
+
+    notifier = FeishuNotifier(settings)
+    date_text = ""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(engine.db_path))
+        try:
+            row = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+            date_text = row[0] if row else ""
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+    pushed = notifier.send_markdown(
+        title="🤖 Sequoia-X 选股 AI 分析",
+        subtitle=f"数据日期：{date_text}" if date_text else "",
+        content=to_lark_md(text),
+        webhook_key="default",
+        template="indigo",
+    )
+    out["analysis_pushed"] = bool(pushed)
+    return out

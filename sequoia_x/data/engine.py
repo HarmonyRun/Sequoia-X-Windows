@@ -959,6 +959,75 @@ class DataEngine:
         """增量更新指定股票（把缺的最新交易日补上）。"""
         self._run_pipeline(symbols)
 
+    def market_breadth(self, date: str) -> dict:
+        """某天的全市场涨跌统计，给大模型分析当「事实依据」。
+
+        没有这些数字，大模型只能对着几个股票代码空谈；有了涨跌家数、涨跌停家数、
+        总成交额，它才能结合当天的市场情绪点评策略选出来的票。
+
+        涨跌幅用「当天收盘 / 上一交易日收盘 - 1」算。涨停用 ±9.8% 近似
+        （ST 股其实是 ±5%，这里不区分——这个数字只作为情绪参考，不参与选股）。
+
+        Args:
+            date: 目标交易日（YYYY-MM-DD）。
+
+        Returns:
+            统计字典；目标日期没有数据时返回 ``{}``。
+        """
+        with _connect(self.db_path) as conn:
+            prev_row = conn.execute(
+                "SELECT MAX(date) FROM stock_daily WHERE date < ?", (date,)
+            ).fetchone()
+            prev = prev_row[0] if prev_row else None
+            if not prev:
+                return {}
+            rows = conn.execute(
+                "SELECT a.close, b.close, a.turnover "
+                "FROM stock_daily a JOIN stock_daily b ON b.symbol = a.symbol "
+                "WHERE a.date = ? AND b.date = ?",
+                (date, prev),
+            ).fetchall()
+
+        if not rows:
+            return {}
+
+        up = down = flat = 0
+        limit_up = limit_down = 0
+        turnover = 0.0
+        total_pct = 0.0
+        counted = 0
+        for close, prev_close, amount in rows:
+            if not prev_close:
+                continue
+            pct = (close / prev_close - 1) * 100
+            total_pct += pct
+            counted += 1
+            if pct > 0.05:
+                up += 1
+            elif pct < -0.05:
+                down += 1
+            else:
+                flat += 1
+            if pct >= 9.8:
+                limit_up += 1
+            elif pct <= -9.8:
+                limit_down += 1
+            if amount:
+                turnover += amount
+
+        return {
+            "date": date,
+            "prev_date": prev,
+            "total": counted,
+            "up": up,
+            "down": down,
+            "flat": flat,
+            "limit_up": limit_up,
+            "limit_down": limit_down,
+            "turnover_yi": round(turnover / 1e8, 1),   # 亿元
+            "avg_pct": round(total_pct / counted, 2) if counted else 0.0,
+        }
+
     # ── 手动数据操作（Web 工作台用）──
 
     def _probe_candidates(self) -> tuple[list[str], list[str]]:

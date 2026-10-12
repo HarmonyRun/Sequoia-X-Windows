@@ -1964,6 +1964,15 @@ function renderSettings(reloadTasks) {
           extra: '<div id="set-probe-result"></div>'
         });
       }
+      if (g.key === 'llm') {
+        // 和「测试推送」同理：地址/模型名写错不会在选股时报错，只会静默分析不出来，
+        // 所以必须有个按钮让用户当场验证。测的是输入框里的值，不必先保存。
+        return renderSettingGroup(g, {
+          actions: '<button type="button" class="btn" id="set-btn-test-llm">测试大模型</button>'
+                 + '<span class="hint">POST /api/settings/test-llm</span>',
+          extra: '<div id="set-llm-result"></div>'
+        });
+      }
       return renderSettingGroup(g, {});
     }).join('') + (s.envPath ? '<div class="set-help">配置文件：' + esc(s.envPath) + '</div>' : '');
   }
@@ -2029,6 +2038,41 @@ function bindSettingsForm() {
   const pbtn = $('#set-btn-probe');
   if (pbtn) {
     pbtn.addEventListener('click', function () { probeSources(pbtn); });
+  }
+
+  // 测试大模型连通性
+  const lbtn = $('#set-btn-test-llm');
+  if (lbtn) {
+    lbtn.addEventListener('click', function () { testLLM(lbtn); });
+  }
+}
+
+/* -------- 设置卡片：大模型连通性测试 -------- */
+
+/** POST /api/settings/test-llm（测输入框里的值，不必先保存） */
+async function testLLM(btn) {
+  const box = $('#set-llm-result');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '测试中…'; }
+  if (box) box.innerHTML = '<div class="set-note info">正在调用大模型，最长可能要 1 分钟…</div>';
+
+  try {
+    const body = {};
+    [['LLM_BASE_URL', 'base_url'], ['LLM_MODEL', 'model'], ['LLM_API_KEY', 'api_key']]
+      .forEach(function (pair) {
+        const el = $('#set-f-' + pair[0]);
+        const v = el ? String(el.value || '').trim() : '';
+        if (v) body[pair[1]] = v;
+      });
+    const data = await api('/api/settings/test-llm', { method: 'POST', body: body });
+    const msg = data.message || '连接成功';
+    if (box) box.innerHTML = noteHTML('ok', msg);
+    showToast('大模型连接成功', 'ok');
+  } catch (e) {
+    if (box) box.innerHTML = noteHTML('err', '连接失败：' + e.message);
+    showError('大模型连接失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old || '测试大模型'; }
   }
 }
 

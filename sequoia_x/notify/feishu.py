@@ -73,6 +73,88 @@ class FeishuNotifier:
             bs.logout()
         return mapping
 
+    def get_stock_names(self, symbols: list[str]) -> dict[str, str]:
+        """公开的股票名称查询（大模型分析模块也要用同一个名称表）。
+
+        名称只用于美化消息，取不到不影响推送，所以内部做了多级回退。
+        """
+        return self._get_stock_names(symbols)
+
+    def send_markdown(
+        self,
+        title: str,
+        content: str,
+        webhook_key: str = "default",
+        subtitle: str = "",
+        template: str = "indigo",
+    ) -> bool:
+        """推一张「长文本」卡片（大模型分析结果用）。
+
+        和 ``send()`` 的区别：那个是选股清单卡片（股票名做成雪球链接），
+        这个是一段 markdown 正文。
+
+        Returns:
+            是否推送成功。
+        """
+        url = self.settings.get_webhook_url(webhook_key)
+        if not url:
+            logger.warning(
+                f"未配置飞书 Webhook，跳过推送 [{webhook_key}]。"
+                "请到 Web 工作台的「设置」页填写主 Webhook 地址。"
+            )
+            return False
+
+        elements: list[dict] = []
+        if subtitle:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**{subtitle}**"},
+            })
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": content},
+        })
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "note",
+            "elements": [{
+                "tag": "plain_text",
+                "content": "由大模型自动生成，仅供研究参考，不构成投资建议。",
+            }],
+        })
+
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {"template": template, "title": {"tag": "plain_text", "content": title}},
+                "elements": elements,
+            },
+        }
+
+        try:
+            resp = requests.post(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            data = resp.json()
+            if resp.status_code != 200 or data.get("code") != 0:
+                logger.error(
+                    f"飞书推送失败 [{webhook_key}] HTTP状态={resp.status_code} "
+                    f"飞书响应={resp.text[:300]}"
+                )
+                return False
+            logger.info(f"飞书推送成功 [{webhook_key}]：{title}")
+            return True
+        except requests.RequestException as exc:
+            logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+            return False
+        except ValueError as exc:
+            logger.error(f"飞书返回不是 JSON [{webhook_key}]：{exc}")
+            return False
+
     def _get_stock_names(self, symbols: list[str]) -> dict[str, str]:
         """查询股票名称，返回 {code: name} 映射。
 

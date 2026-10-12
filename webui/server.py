@@ -41,7 +41,7 @@ load_dotenv(REPO / ".env")
 
 from sequoia_x.core.config import get_settings, reset_settings  # noqa: E402
 from sequoia_x.data.engine import DataEngine  # noqa: E402
-from sequoia_x.pipeline import run_strategies, strategy_meta  # noqa: E402
+from sequoia_x.pipeline import run_daily, run_strategies, strategy_meta  # noqa: E402
 from webui import envstore  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -1008,7 +1008,18 @@ class JobManager:
         added = engine.sync_today_bulk()
         job.add_log(f"增量同步完成，新增 {added} 行")
         job.progress = {"done": 0, "total": 7, "text": "执行 7 个策略并推送飞书…"}
-        run_strategies(engine, settings, push=True, on_strategy=on_strategy)
+
+        # 走和命令行同一条流程（含大模型分析）——两边行为必须一致
+        outcome = run_daily(engine, settings, push=True, on_strategy=on_strategy)
+
+        if outcome.get("analysis"):
+            job.progress = {"done": 7, "total": 7, "text": "AI 分析完成"}
+            if outcome.get("analysis_pushed"):
+                job.add_log("大模型分析已推送到飞书")
+            else:
+                job.add_log("大模型分析已生成，但推送失败（检查设置里的飞书 Webhook）")
+        elif getattr(settings, "llm_enabled", False):
+            job.add_log("启用了大模型分析，但这次没有产出（详见上方日志）")
 
     def _job_sync(self, job: Job) -> None:
         """只回填当日最新数据（增量，最快）。"""
@@ -1178,6 +1189,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_settings_save(body)
             if parsed.path == "/api/settings/test-feishu":
                 return self._api_test_feishu(body)
+            if parsed.path == "/api/settings/test-llm":
+                return self._api_test_llm(body)
             if parsed.path == "/api/settings/probe-sources":
                 return self._api_probe_sources()
             if parsed.path == "/api/tasks/action":
@@ -1524,6 +1537,58 @@ class Handler(BaseHTTPRequestHandler):
             })
         else:
             self._error(f"推送失败：{message}")
+
+    def _api_test_llm(self, body: dict) -> None:
+        """测试大模型能不能调通。
+
+        和「测试推送」同样的道理：地址或模型名写错**不会在选股时报错**，
+        只会静默分析不出来，所以必须有个按钮让用户当场验证。
+        可以直接测输入框里还没保存的值。
+        """
+        from sequoia_x.analyze.llm import LLMError, chat
+
+        params = envstore.llm_from(body)
+        base_url = (params.get("base_url") or "").strip()
+        model = (params.get("model") or "").strip()
+        if not base_url:
+            return self._error("还没有填「接口地址（Base URL）」")
+        if not model:
+            return self._error("还没有填「模型名」")
+        if not base_url.startswith(("http://", "https://")):
+            return self._error("接口地址必须是以 http:// 或 https:// 开头的地址")
+
+        # 借用一份临时 Settings，不污染进程里的单例
+        try:
+            probe = get_settings().model_copy(update={
+                "llm_enabled": True,
+                "llm_base_url": base_url,
+                "llm_model": model,
+                "llm_api_key": params.get("api_key") or "",
+            })
+        except Exception as exc:  # noqa: BLE001
+            return self._error(f"读取当前配置失败：{exc}")
+
+        try:
+            reply = chat(
+                probe,
+                [
+                    {"role": "system", "content": "你是一个测试助手，只回答用户要求的内容。"},
+                    {"role": "user", "content": "请只回复两个字：正常"},
+                ],
+                timeout=60,
+            )
+        except LLMError as exc:
+            return self._error(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return self._error(f"{type(exc).__name__}: {exc}")
+
+        log.info(f"大模型连通性测试成功：{model} @ {base_url}")
+        self._json({
+            "ok": True,
+            "message": f"连接成功，模型回复：{reply[:60]}",
+            "model": model,
+            "base_url": base_url,
+        })
 
     def _api_probe_sources(self) -> None:
         results = get_engine().probe_all_sources()

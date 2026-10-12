@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     feishu_webhook_url: str = ""
     strategy_webhooks: dict[str, str] = {}
 
+    # ── 大模型分析（可选）──
+    # 开启后，每天选股跑完会把「当天市场情况 + 各策略选出的股票」交给大模型分析，
+    # 分析结果推送到飞书。用的是 **OpenAI 兼容的 /chat/completions 接口**，
+    # 所以同一套代码能支持 DeepSeek / 通义 / 智谱 / Moonshot / 本地 Ollama 等，
+    # 用户只要填 base_url + model + api_key 三样。
+    #
+    # 默认关闭：安装包分发的场景下多数用户不会配，没配就必须安静地跳过，
+    # 不能因为缺配置就让整条流水线报错。
+    llm_enabled: bool = False
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
