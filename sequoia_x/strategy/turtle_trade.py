@@ -27,10 +27,13 @@ class TurtleTradeStrategy(BaseStrategy):
         """查询候选股票的流通市值。
 
         数据源跟随 ``engine.data_source``：
-        - akshare：直接取东方财富全市场快照的「流通市值」列（一次调用）
+        - akshare 系（东方财富/腾讯/新浪/auto）：取东方财富全市场快照的「流通市值」列
         - baostock：流通股本 = 成交量 / (换手率% / 100)，流通市值 = 流通股本 × 不复权收盘价
+
+        注意市值只用于**排序**（不参与过滤），所以快照拿不到时策略仍然出同样的
+        候选集合，只是顺序不同——属于可接受的降级。
         """
-        if getattr(self.engine, "data_source", "baostock") == "akshare":
+        if getattr(self.engine, "data_source", "baostock") != "baostock":
             return self._get_market_caps_akshare(symbols)
 
         from datetime import date

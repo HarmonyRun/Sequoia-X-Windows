@@ -85,7 +85,7 @@ class FeishuNotifier:
             return {c: _NAME_CACHE[c] for c in symbols if c in _NAME_CACHE}
 
         _NAME_LOOKUP_DONE = True
-        if self.settings.data_source == "akshare":
+        if self.settings.data_source != "baostock":
             _NAME_CACHE = self._names_from_akshare()
         if not _NAME_CACHE:
             try:

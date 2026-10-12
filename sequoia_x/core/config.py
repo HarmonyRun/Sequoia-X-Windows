@@ -7,18 +7,36 @@ class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
     start_date: str = "2024-01-01"
 
-    # 行情数据源：baostock（项目默认）或 akshare（东方财富）
-    # 两者后复权算法不同，同一张表里绝不能混用，切换时必须清库重拉。
+    # 行情数据源：
+    #   baostock   = 项目原设计
+    #   eastmoney  = 东方财富（akshare，本机当前默认）
+    #   tencent    = 腾讯（akshare stock_zh_a_hist_tx）
+    #   sina       = 新浪（akshare stock_zh_a_daily）
+    #   auto       = 自动：按 auto_source_order 依次探测，某个源连接异常/被限流
+    #                就自动切到下一个源，继续把剩余数据补完
+    # ⚠️ 不同源的后复权算法不同（同一只股票同一天的价格基准能差 40%），
+    #    所以每只股票的数据源会被记录在 symbol_source 表里，增量更新只认这个源，
+    #    绝不允许同一只股票一半用 A 源、一半用 B 源。
     data_source: str = "baostock"
 
-    # akshare 回填时的并发线程数。东方财富对高频请求会瞬时断连（表现为
-    # RemoteDisconnected / ProxyError），并发不宜高，4 是实测较稳的值。
+    # auto 模式下数据源的尝试顺序（逗号分隔）。
+    auto_source_order: str = "eastmoney,tencent,sina"
+
+    # 回填并发线程数。东方财富对高频请求会瞬时断连（RemoteDisconnected /
+    # ProxyError），并发不宜高；连续拉几千只后还会升级为硬限流，2 是实测较稳的值。
     ak_workers: int = 4
 
-    # 每次 akshare 请求前的间隔（秒）。连续拉几千只之后东方财富会升级为
-    # 硬限流（实测失败率从 13% 一路涨到 79%，之后整段冷却期内 100% 失败），
-    # 补缺口时把并发降到 2、间隔加到 0.3~0.5 秒会温和很多。
+    # 每次请求前的间隔（秒）。连续拉几千只之后东方财富会升级为硬限流
+    # （实测失败率从 13% 一路涨到 79%，之后整段冷却期内 100% 失败），
+    # 补缺口时用 2 线程 + 0.3 秒会温和很多。
     ak_delay: float = 0.0
+
+    # 单只股票连续多少个交易日拿不到新数据后，允许换一个可用的数据源
+    # 「整只重拉」。换源会改变该股票的历史价格基准，但同股票内部仍然自洽
+    # （所有策略用的都是同股票内部的比值），所以不影响信号。
+    # 1 = 每日回填时源不可用就立刻换（保证全市场数据截止日一致）；
+    # 2 = 更保守，等源挂满 2 个交易日才换。
+    rebase_stale_days: int = 1
 
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}

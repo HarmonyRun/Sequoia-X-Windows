@@ -1,11 +1,16 @@
 """Sequoia-X V2 主程序入口。
 
 两种运行模式（具体用哪个数据源由 .env 里的 DATA_SOURCE 决定）：
-  python main.py               # 日常模式：增量补当天数据 + 跑策略 + 飞书推送（2~5分钟）
-  python main.py --backfill    # 回填模式：拉全市场历史K线（首次/补数据用，akshare 约40分钟）
+  python main.py               # 日常模式：增量补最新交易日 + 跑策略 + 飞书推送
+  python main.py --backfill    # 回填模式：补齐全市场缺失的历史/最新 K 线（可续传）
 
-数据源：
-  baostock = 项目原设计；akshare = 东方财富（本机当前使用，见 README/使用说明第六节）
+数据源（.env 的 DATA_SOURCE）：
+  auto      = 自动（推荐）：按 AUTO_SOURCE_ORDER 探测，某个源连接异常或被限流
+              就自动切到下一个源继续补（东方财富 -> 腾讯 -> 新浪）
+  eastmoney = 东方财富；tencent = 腾讯；sina = 新浪；baostock = 项目原设计
+
+⚠️ 三个 akshare 系源的后复权基准互不相同，所以同一只股票绝不跨源拼接：
+   每只股票用的源记录在 symbol_source 表，增量更新只认这个源。
 """
 
 import argparse
