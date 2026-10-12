@@ -146,7 +146,9 @@ def _ak_to_rows(df, symbol: str) -> pd.DataFrame:
     return out[_AK_ROWS]
 
 
-def _ak_fetch_history(symbol: str, start: str, end: str, retries: int = 4) -> pd.DataFrame | None:
+def _ak_fetch_history(
+    symbol: str, start: str, end: str, retries: int = 4, delay: float = 0.0
+) -> pd.DataFrame | None:
     """拉单只股票的后复权日 K（akshare）。
 
     返回 None 表示**请求失败**；返回空 DataFrame 表示请求成功但该区间没有
@@ -158,6 +160,8 @@ def _ak_fetch_history(symbol: str, start: str, end: str, retries: int = 4) -> pd
     import akshare as ak
 
     for attempt in range(retries):
+        if delay:
+            time.sleep(delay)
         try:
             df = ak.stock_zh_a_hist(
                 symbol=symbol,
@@ -183,6 +187,7 @@ class DataEngine:
         self.start_date: str = settings.start_date
         self.data_source: str = (settings.data_source or "baostock").lower()
         self.ak_workers: int = max(1, int(settings.ak_workers or 4))
+        self.ak_delay: float = max(0.0, float(settings.ak_delay or 0.0))
         self._init_db()
         logger.info(f"数据源：{self.data_source}")
 
@@ -549,13 +554,18 @@ class DataEngine:
                 logger.info(f"回填完成：全部 {len(symbols)} 只已是最新")
                 return
 
-            logger.info(f"第 {rnd}/{max_rounds} 轮：待补 {len(todo)} 只，{self.ak_workers} 线程并发...")
+            logger.info(
+                f"第 {rnd}/{max_rounds} 轮：待补 {len(todo)} 只，"
+                f"{self.ak_workers} 线程并发，间隔 {self.ak_delay}s..."
+            )
             ok = failed = 0
             done = 0
 
             with ThreadPoolExecutor(max_workers=self.ak_workers) as pool:
                 futures = {
-                    pool.submit(_ak_fetch_history, symbol, start, target_end): symbol
+                    pool.submit(
+                        _ak_fetch_history, symbol, start, target_end, 4, self.ak_delay
+                    ): symbol
                     for symbol, start in todo
                 }
                 for fut in as_completed(futures):

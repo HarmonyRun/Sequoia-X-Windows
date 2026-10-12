@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     # RemoteDisconnected / ProxyError），并发不宜高，4 是实测较稳的值。
     ak_workers: int = 4
 
+    # 每次 akshare 请求前的间隔（秒）。连续拉几千只之后东方财富会升级为
+    # 硬限流（实测失败率从 13% 一路涨到 79%，之后整段冷却期内 100% 失败），
+    # 补缺口时把并发降到 2、间隔加到 0.3~0.5 秒会温和很多。
+    ak_delay: float = 0.0
+
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
 
