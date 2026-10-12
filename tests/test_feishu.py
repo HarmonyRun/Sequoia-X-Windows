@@ -12,6 +12,18 @@ from sequoia_x.core.config import Settings
 from sequoia_x.notify.feishu import FeishuNotifier
 
 
+@pytest.fixture(autouse=True)
+def _no_network_name_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """名称查询会走网络（akshare/baostock），单元测试里必须屏蔽。
+
+    名称只影响卡片里的显示文字，不影响被测的「请求体包含全部 symbol / URL 正确 /
+    失败记日志」这些行为，所以返回空映射即可，断言依然成立（此时显示退化为代码）。
+    """
+    monkeypatch.setattr(
+        FeishuNotifier, "_get_stock_names", lambda self, symbols: {}
+    )
+
+
 def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     return Settings(
         db_path="data/test.db",

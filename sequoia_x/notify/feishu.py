@@ -10,6 +10,11 @@ from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 全市场「代码 -> 名称」映射缓存（一次请求覆盖全部股票，进程内复用）
+_NAME_CACHE: dict[str, str] = {}
+# 名称查询只尝试一次：baostock 被封或网络不通时不反复重试，避免拖慢整个流程
+_NAME_LOOKUP_DONE = False
+
 
 class FeishuNotifier:
     """飞书 Webhook 推送器。
@@ -37,20 +42,59 @@ class FeishuNotifier:
             return f"BJ{code}"
         return f"SZ{code}"
 
-    @staticmethod
-    def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
+    def _names_from_akshare(self) -> dict[str, str]:
+        """用 akshare 一次性拿全市场代码/名称（带重试）。"""
+        import akshare as ak
+
+        from sequoia_x.data.engine import _ak_retry
+
+        df = _ak_retry(lambda: ak.stock_info_a_code_name(), "股票名称表", retries=3)
+        if df is None or df.empty or "name" not in df.columns:
+            return {}
+        return {
+            str(c).zfill(6): str(n)
+            for c, n in zip(df["code"], df["name"])
+        }
+
+    def _names_from_baostock(self, symbols: list[str]) -> dict[str, str]:
+        """用 baostock 逐只查询股票名称（数据源回退用）。"""
         import baostock as bs
+
+        mapping: dict[str, str] = {}
         bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
+        try:
+            for code in symbols:
+                prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                rs = bs.query_stock_basic(code=f"{prefix}.{code}")
+                while rs.next():
+                    row = rs.get_row_data()
+                    mapping[code] = row[1]  # 第2个字段是股票名称
+        finally:
+            bs.logout()
         return mapping
+
+    def _get_stock_names(self, symbols: list[str]) -> dict[str, str]:
+        """查询股票名称，返回 {code: name} 映射。
+
+        名称只用于美化推送，取不到也不影响推送本身，所以这里做多级回退：
+        akshare 全市场表（一次请求，带缓存） -> baostock 逐只 -> 空（消息里退化为代码）。
+        """
+        global _NAME_CACHE, _NAME_LOOKUP_DONE
+
+        if _NAME_LOOKUP_DONE:
+            return {c: _NAME_CACHE[c] for c in symbols if c in _NAME_CACHE}
+
+        _NAME_LOOKUP_DONE = True
+        if self.settings.data_source == "akshare":
+            _NAME_CACHE = self._names_from_akshare()
+        if not _NAME_CACHE:
+            try:
+                _NAME_CACHE = self._names_from_baostock(symbols)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"股票名称查询失败（推送将只显示代码）：{exc}")
+                _NAME_CACHE = {}
+
+        return {c: _NAME_CACHE[c] for c in symbols if c in _NAME_CACHE}
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")
