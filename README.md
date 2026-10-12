@@ -27,6 +27,11 @@
 > 📌 **遇到的问题请先分清是哪个仓库的**：策略算法、原 baostock 数据层相关的问题属于原项目；
 > Windows 安装包、Web 工作台、多数据源换源、大模型分析相关的问题才属于本分支。
 
+> 📦 **同一作者的另一个版本**：飞牛 fnOS 原生应用版在
+> [HarmonyRun/Sequoia-X-Community](https://github.com/HarmonyRun/Sequoia-X-Community)
+> ——那个仓库保留了对上游的 GitHub fork 关系（GitHub 限制：同一上游在一个账号下只能有一个 fork）。
+> 本仓库是 **Windows 桌面版**，两者同源但各自独立发布，按需取用。
+
 ---
 
 ## 本分支做了什么 | What This Fork Adds
