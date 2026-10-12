@@ -49,6 +49,12 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+# 按日期查（「库里有哪些交易日」「比某天更新的交易日有几个」）如果没有这个索引
+# 会全表扫 340 万行，实测 1.75 秒；建了之后 0.24 秒。Web 工作台的数据覆盖页要用。
+_CREATE_DATE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_stock_daily_date ON stock_daily (date);
+"""
+
 # 记录每只股票的数据来源。不同源的后复权基准不同，同一只股票必须始终用同一个源，
 # 否则历史与增量之间会出现假跳空。换源时必须「整只重拉」（见 _rebase_symbol）。
 _CREATE_SOURCE_SQL = """
@@ -325,6 +331,7 @@ class DataEngine:
         with _connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_DATE_INDEX_SQL)
             conn.execute(_CREATE_SOURCE_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")

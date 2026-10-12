@@ -171,15 +171,19 @@ _coverage_lock = threading.Lock()
 _coverage_cache: dict | None = None
 _coverage_at: float = 0.0
 
+_dbstats_cache: dict | None = None
+_dbstats_at: float = 0.0
+
 
 def get_coverage(force: bool = False) -> dict:
-    """每只股票的行数、最新日期、数据源、板块。带 60 秒缓存。
+    """每只股票的行数、最新日期、数据源、板块。带 300 秒缓存。
 
-    ``stale_days`` 用「库里比它更新的交易日有几个」算，这样不需要外部交易日历。
+    重建一次要扫 340 万行（约 0.8 秒），所以缓存久一点；需要立刻刷新时用
+    ``force=True``（例如回填任务跑完之后）。
     """
     global _coverage_cache, _coverage_at
     with _coverage_lock:
-        if _coverage_cache is not None and not force and time.time() - _coverage_at < 60:
+        if _coverage_cache is not None and not force and time.time() - _coverage_at < 300:
             return _coverage_cache
 
         import sqlite3
@@ -201,9 +205,14 @@ def get_coverage(force: bool = False) -> dict:
             conn.close()
 
         names = get_name_map()
+        # stale_days = 「库里比它更新的交易日有几个」。用「日期 → 序号」查表算，
+        # 不要写成 sum(1 for d in all_dates if d > last)——那是 5224×669 次比较，
+        # 每次刷新要 2.4 秒。查表是 O(1)。
+        date_idx = {d: i for i, d in enumerate(all_dates)}
+        last_pos = len(all_dates) - 1
         items = []
         for symbol, cnt, last in rows:
-            later = sum(1 for d in all_dates if d > last)
+            later = last_pos - date_idx.get(last, last_pos)
             items.append({
                 "symbol": symbol,
                 "name": names.get(symbol, ""),
@@ -240,6 +249,11 @@ def get_coverage(force: bool = False) -> dict:
 
 
 def db_stats() -> dict:
+    """库统计。COUNT(*) 要扫 340 万行（约 0.6 秒），所以缓存 30 秒。"""
+    global _dbstats_cache, _dbstats_at
+    if _dbstats_cache is not None and time.time() - _dbstats_at < 30:
+        return _dbstats_cache
+
     import sqlite3
 
     settings = get_settings()
@@ -252,7 +266,7 @@ def db_stats() -> dict:
     finally:
         conn.close()
     size_mb = round(db.stat().st_size / 1048576, 1) if db.exists() else 0.0
-    return {
+    _dbstats_cache = {
         "path": settings.db_path,
         "size_mb": size_mb,
         "symbols": symbols,
@@ -261,6 +275,8 @@ def db_stats() -> dict:
         "min_date": lo,
         "max_date": hi,
     }
+    _dbstats_at = time.time()
+    return _dbstats_cache
 
 
 # schtasks 的返回码含义（十进制）。0x41303 等其实都是「成功」类别，
@@ -288,6 +304,48 @@ def _result_text(raw: str | None) -> tuple[str | None, bool | None]:
         return ("失败", int(key) == 0)
     except ValueError:
         return (key, None)
+
+
+# schtasks 输出的键名（小写）：中英文都认
+_TASK_KEYS = {
+    "state": ("status", "状态"),
+    "next_run": ("next run time", "下次运行时间"),
+    "last_run": ("last run time", "上次运行时间"),
+    "last_result": ("last result", "上次结果"),
+}
+
+# 「状态」字段的可能取值（小写）→ 统一成英文枚举，前端按英文判断
+_STATE_WORDS = {
+    "ready": "Ready", "running": "Running", "disabled": "Disabled",
+    "queued": "Queued", "unknown": "Unknown",
+    "就绪": "Ready", "正在运行": "Running", "已禁用": "Disabled",
+    "排队中": "Queued", "未知": "Unknown",
+}
+
+_tasks_cache: list[dict] | None = None
+_tasks_at: float = 0.0
+
+
+def _decode_output(raw: bytes) -> str:
+    """探测 schtasks 输出的编码：逐个试，哪个能解出可识别的键名就用哪个。"""
+    for enc in ("utf-8", "gbk", "mbcs", "latin-1"):
+        try:
+            text = raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        low = text.lower()
+        if "status" in low or "状态" in text:
+            return text
+    return raw.decode("utf-8", errors="replace")
+
+
+def _task_field(key: str) -> str | None:
+    """把一行输出的键名映射到字段名（大小写不敏感、中英文都认）。"""
+    k = key.strip().lower()
+    for field, aliases in _TASK_KEYS.items():
+        if k in aliases:
+            return field
+    return None
 
 
 # ── 停牌核查 ──
@@ -364,7 +422,17 @@ def check_suspended(symbols: list[str]) -> list[dict]:
 
 
 def list_tasks() -> list[dict]:
-    """通过 schtasks 读计划任务状态（只读，不修改）。"""
+    """通过 schtasks 读计划任务状态（只读，不修改）。
+
+    schtasks 的输出**语言和编码都不稳定**：同一台机器上，有时给英文键名
+    （``Status: Ready``），有时给中文（``状态: 就绪``）；编码可能是 gbk 也可能是
+    utf-8。所以这里不硬编码，而是先探测编码，再中英文键名都认，最后还有一层
+    「按值判断」的兜底。结果缓存 20 秒，避免每次打开页面都去起一个进程。
+    """
+    global _tasks_cache, _tasks_at
+    if _tasks_cache is not None and time.time() - _tasks_at < 20:
+        return _tasks_cache
+
     import subprocess
 
     names = ["Sequoia-X收盘后回填", "Sequoia-X每日选股"]
@@ -375,29 +443,32 @@ def list_tasks() -> list[dict]:
         try:
             proc = subprocess.run(
                 ["schtasks", "/query", "/tn", name, "/fo", "LIST", "/v"],
-                capture_output=True, text=True, encoding="gbk", errors="replace",
-                timeout=20,
+                capture_output=True, timeout=20,
             )
-            text = proc.stdout or ""
+            text = _decode_output(proc.stdout or b"")
             for raw in text.splitlines():
                 line = raw.strip()
                 if not line or ":" not in line:
                     continue
                 key, _, val = line.partition(":")
-                key, val = key.strip(), val.strip()
-                if key in ("状态", "Status"):
-                    info["state"] = val
-                elif key in ("下次运行时间", "Next Run Time"):
-                    info["next_run"] = val
-                elif key in ("上次运行时间", "Last Run Time"):
-                    info["last_run"] = val
-                elif key in ("上次结果", "Last Result"):
-                    info["last_result"] = val
+                field = _task_field(key)
+                if field:
+                    info[field] = val.strip()
+
+            # 兜底：个别系统上「状态」那行的键名认不出来，就直接看值
+            if info["state"] == "未知":
+                for raw in text.splitlines():
+                    val = raw.partition(":")[2].strip().lower()
+                    if val in _STATE_WORDS:
+                        info["state"] = _STATE_WORDS[val]
+                        break
         except Exception as exc:  # noqa: BLE001
             info["state"] = f"读取失败：{exc}"
-        text, _ok = _result_text(info["last_result"])
-        info["last_result_text"] = text
+
+        info["last_result_text"] = _result_text(info["last_result"])[0]
         out.append(info)
+
+    _tasks_cache, _tasks_at = out, time.time()
     return out
 
 
