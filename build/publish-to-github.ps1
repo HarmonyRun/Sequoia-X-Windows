@@ -310,9 +310,15 @@ Sequoia-X-Setup.exe /S /D="D:\Apps\Sequoia-X" [/NoData] [/NoDesktop] [/NoStartMe
             prerelease       = $false
         } | ConvertTo-Json -Depth 3
 
+        # ⚠️ 必须把 JSON 转成 UTF-8 **字节**再发。
+        # PowerShell 5.1 的 Invoke-RestMethod 收到字符串时按 ISO-8859-1 编码，
+        # 中文会全变成「?」——第一次发布就把 Release 正文毁了 204 个问号。
+        $relBytes = [System.Text.Encoding]::UTF8.GetBytes($relBody)
+
         try {
             $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/$RepoName/releases" `
-                -Method Post -Headers $Headers -Body $relBody -ContentType "application/json" -TimeoutSec 60
+                -Method Post -Headers $Headers -Body $relBytes `
+                -ContentType "application/json; charset=utf-8" -TimeoutSec 60
             Ok "Release 已建：$($rel.tag_name)"
         } catch {
             # 已存在就复用
