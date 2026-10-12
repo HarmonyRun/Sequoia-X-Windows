@@ -785,7 +785,14 @@ class DataEngine:
             return (symbol, self.start_date, list(healthy), True)
         return None
 
-    def _store(self, symbol, rows, source: str, rebase: bool = False) -> None:
+    def _store(
+        self,
+        symbol,
+        rows,
+        source: str,
+        rebase: bool = False,
+        replace_range: tuple | None = None,
+    ) -> None:
         """把某只股票的数据和它的来源写在同一个事务里。
 
         顺序很重要：**先记来源，再写数据**。如果反过来（先写数据、后记来源），
@@ -794,6 +801,13 @@ class DataEngine:
 
         反过来先记来源则最多留下「有来源、没数据」，那只股票会被当成全新股票
         重新拉取，不会污染任何已有数据。
+
+        Args:
+            rebase: 整只重拉——先删掉这只股票的全部历史再写。
+            replace_range: 只覆盖这个日期区间 ``(start, end)``。
+                必须用它而不是直接 INSERT：``stock_daily`` 上有 ``UNIQUE(symbol, date)``，
+                区间内只要有一天已存在，普通 INSERT 就会抛 IntegrityError，
+                整个事务（包括这一批的所有行）会被回滚，结果一行都写不进去。
         """
         from datetime import datetime
 
@@ -806,6 +820,11 @@ class DataEngine:
             )
             if rebase:
                 conn.execute("DELETE FROM stock_daily WHERE symbol = ?", (symbol,))
+            elif replace_range:
+                conn.execute(
+                    "DELETE FROM stock_daily WHERE symbol = ? AND date >= ? AND date <= ?",
+                    (symbol, replace_range[0], replace_range[1]),
+                )
             if not rows.empty:
                 rows.to_sql(
                     "stock_daily", conn, if_exists="append",
@@ -813,7 +832,15 @@ class DataEngine:
                 )
             conn.commit()
 
-    def _fetch_and_store(self, symbol, start, sources, target_end, rebase=False) -> bool:
+    def _fetch_and_store(
+        self,
+        symbol,
+        start,
+        sources,
+        target_end,
+        rebase=False,
+        replace_range=None,
+    ) -> bool:
         """按候选源顺序拉一段并写入，第一个成功的源就用它。
 
         ``sources`` 是列表：某个源对这只股票恰好没有数据（返回 None）时自动换
@@ -826,24 +853,30 @@ class DataEngine:
                 logger.debug(f"[{symbol}] 数据源 {source} 请求失败，尝试下一个源")
                 continue
             try:
-                self._store(symbol, rows, source, rebase)
+                self._store(symbol, rows, source, rebase, replace_range)
             except sqlite3.IntegrityError:
                 pass  # 已存在，算成功
             return True
         return False
 
     def _process_batch(self, todo: list) -> tuple[int, int]:
-        """并发处理一批 (symbol, start, sources, rebase, target_end)，返回 (成功, 失败)。"""
+        """并发处理一批，返回 (成功, 失败)。
+
+        每一项是 ``(symbol, start, sources, rebase, target_end[, replace_range])``，
+        第 6 项只有「覆盖指定区间」时才有。
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         ok = failed = done = 0
         with ThreadPoolExecutor(max_workers=self.ak_workers) as pool:
-            futures = {
-                pool.submit(
-                    self._fetch_and_store, symbol, start, sources, target_end, rebase
-                ): symbol
-                for symbol, start, sources, rebase, target_end in todo
-            }
+            futures = {}
+            for item in todo:
+                symbol, start, sources, rebase, target_end = item[:5]
+                replace_range = item[5] if len(item) > 5 else None
+                futures[pool.submit(
+                    self._fetch_and_store, symbol, start, sources,
+                    target_end, rebase, replace_range,
+                )] = symbol
             for fut in as_completed(futures):
                 symbol = futures[fut]
                 done += 1
@@ -925,6 +958,108 @@ class DataEngine:
     def _update_symbols(self, symbols: list[str]) -> None:
         """增量更新指定股票（把缺的最新交易日补上）。"""
         self._run_pipeline(symbols)
+
+    # ── 手动数据操作（Web 工作台用）──
+
+    def _probe_candidates(self) -> tuple[list[str], list[str]]:
+        """探测数据源，返回 ``(候选列表, 可用列表)``。两个都可能是空列表。"""
+        candidates = self._source_candidates()
+        if not candidates:
+            logger.warning(f"数据源 {self.data_source} 不支持增量回填（只有 baostock 走原路径）")
+            return [], []
+        healthy = [s for s in candidates if probe_source(s)]
+        if not healthy:
+            logger.error("所有候选数据源都探测失败，本次不跑（稍后重跑即可续传）")
+        return candidates, healthy
+
+    def _target_end(self) -> str:
+        """本次回填的目标交易日。
+
+        收盘前（15:00）拿到的当日 K 线是未完成的，会污染信号，所以取昨天。
+        """
+        from datetime import date, datetime, timedelta
+
+        now = datetime.now()
+        cutoff = date.today() if now.hour >= 15 else date.today() - timedelta(days=1)
+        return self._last_trading_day(cutoff)
+
+    def force_reload(self, symbols: list[str]) -> dict:
+        """整只重拉：先删掉这些股票的全部历史，再从可用源重新拉一遍。
+
+        只有**拿到新数据之后**才会删——``_store`` 里的「先删后写」在同一个事务里，
+        所以万一所有数据源都失败，原数据一行都不会丢。换源也是安全的：整只重拉
+        之后同股票内部仍然自洽（所有策略用的都是同股票内部的比值）。
+        """
+        if not symbols:
+            return {"total": 0, "ok": 0, "failed": 0}
+        _candidates, healthy = self._probe_candidates()
+        if not healthy:
+            return {"total": len(symbols), "ok": 0, "failed": len(symbols)}
+
+        target_end = self._target_end()
+        logger.info(f"整只重拉 {len(symbols)} 只，目标交易日 {target_end}，可用源 {healthy}")
+        todo = [(s, self.start_date, list(healthy), True, target_end) for s in symbols]
+        ok, failed = self._process_batch(todo)
+        logger.info(f"整只重拉结束：成功 {ok} 失败 {failed}")
+        return {"total": len(symbols), "ok": ok, "failed": failed}
+
+    def fill_range(self, symbols: list[str], start: str, end: str) -> dict:
+        """覆盖式补齐指定日期区间：先删该区间再重写，已有的行会被刷新。
+
+        同一只股票只允许用它记在 ``symbol_source`` 里的那个源——跨源拼出来的
+        历史会有假跳空。记录里的源不可用就**跳过**这只股票，绝不换源补一段。
+        """
+        if not symbols:
+            return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+        _candidates, healthy = self._probe_candidates()
+        if not healthy:
+            return {"total": len(symbols), "ok": 0, "failed": len(symbols), "skipped": 0}
+
+        todo, skipped = [], 0
+        for symbol in symbols:
+            src = self._get_symbol_source(symbol)
+            if src is None:
+                sources = list(healthy)   # 全新股票：哪个源都行
+            elif src in healthy:
+                sources = [src]           # 必须沿用原源
+            else:
+                logger.warning(f"[{symbol}] 原数据源 {src} 不可用，跳过（不换源补区间）")
+                skipped += 1
+                continue
+            todo.append((symbol, start, sources, False, end, (start, end)))
+
+        logger.info(
+            f"补区间 {start} ~ {end}：待处理 {len(todo)} 只，跳过 {skipped} 只，可用源 {healthy}"
+        )
+        ok, failed = self._process_batch(todo)
+        logger.info(f"补区间结束：成功 {ok} 失败 {failed} 跳过 {skipped}")
+        return {"total": len(symbols), "ok": ok, "failed": failed, "skipped": skipped}
+
+    def probe_all_sources(self) -> list[dict]:
+        """逐个探测候选数据源，给 Web 工作台的「探测健康度」用。"""
+        import time as _time
+
+        labels = {
+            "eastmoney": "东方财富", "tencent": "腾讯",
+            "sina": "新浪", "baostock": "baostock",
+        }
+        out = []
+        for source in self._source_candidates():
+            if source not in AKSHARE_SOURCES:
+                out.append({"source": source, "label": labels.get(source, source),
+                            "ok": None, "ms": None, "error": "该源不支持增量回填"})
+                continue
+            t0 = _time.time()
+            try:
+                ok = bool(probe_source(source))
+                err = None if ok else "探测失败（连接异常或被限流）"
+            except Exception as exc:  # noqa: BLE001
+                ok, err = False, f"{type(exc).__name__}: {exc}"
+            out.append({
+                "source": source, "label": labels.get(source, source),
+                "ok": ok, "ms": int((_time.time() - t0) * 1000), "error": err,
+            })
+        return out
 
     def migrate_source_records(self, source: str = "eastmoney") -> int:
         """给「已有数据但没有来源记录」的老股票补上来源。

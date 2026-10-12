@@ -11,7 +11,8 @@
  *   7. Tab3 个股（K 线 + 成交量 + 均线 + 悬停 tooltip）
  *   8. Tab4 数据覆盖（筛选 / 搜索 / 分页）
  *   9. Tab5 运行与日志（提交任务 / 1.5s 轮询 / 日志文件）
- *  10. 初始化
+ *  10. Tab6 设置（接口驱动的表单 / 数据操作 / 计划任务 / 数据库与缓存）
+ *  11. 初始化
  * ========================================================================= */
 'use strict';
 
@@ -167,14 +168,18 @@ const STRATEGY_FALLBACK = {
 const JOB_KIND_LABEL = {
   daily:    '日常选股（含飞书推送）',
   signals:  '只计算信号（不推送）',
-  backfill: '回填全市场最新数据'
+  backfill: '回填数据',
+  sync:     '同步当日最新数据',
+  reload:   '整只重拉（删后重拉）'
 };
 
 /** 任务类型 -> 中文短名 */
 const JOB_KIND_SHORT = {
   daily:    '日常选股',
   signals:  '信号计算',
-  backfill: '数据回填'
+  backfill: '数据回填',
+  sync:     '当日同步',
+  reload:   '整只重拉'
 };
 
 /* =======================================================================
@@ -184,7 +189,7 @@ const JOB_KIND_SHORT = {
 const state = {
   tab: 'overview',
   /** 各 tab 是否已懒加载过 */
-  loaded: { overview: false, signals: false, coverage: false, jobs: false },
+  loaded: { overview: false, signals: false, coverage: false, jobs: false, settings: false },
   overview: null,
   strategies: null,          // /api/strategies 的 strategies 数组
   strategiesPromise: null,
@@ -198,7 +203,19 @@ const state = {
   logFiles: [],
   logCurrent: null,
   suggestItems: [],
-  suggestIndex: -1
+  suggestIndex: -1,
+  /* ---- Tab6 设置 ---- */
+  settings: {
+    groups: [],              // /api/settings 的 groups
+    config: {},              // /api/settings 的 config
+    envPath: '',
+    values: {},              // KEY -> 已保存的值（用于 diff / 放弃改动）
+    dirty: {},               // KEY -> true（只记录改动过的 key）
+    busy: false,
+    probe: null,             // 数据源探测结果
+    backups: [],             // /api/db/backups 的文件列表
+    lastJob: {}              // 操作名 -> 最近一次提交的任务 {id,kind,status}
+  }
 };
 
 /** 简易 API 封装：统一解析 JSON、统一抛错（调用方负责 showError） */
@@ -292,7 +309,7 @@ function strategyMeta(key) {
  * 3. 路由与 Tab 切换（URL hash，刷新保持当前 tab，懒加载）
  * ======================================================================= */
 
-const TABS = ['overview', 'signals', 'stock', 'coverage', 'jobs'];
+const TABS = ['overview', 'signals', 'stock', 'coverage', 'jobs', 'settings'];
 
 /** 从 location.hash 解析当前 tab（支持 #stock/600519 这种带股票代码的深链接） */
 function tabFromHash() {
@@ -334,6 +351,8 @@ function switchTab(name) {
     }
   } else if (name === 'jobs' && !state.loaded.jobs) {
     loadJobs().catch(function (e) { showError(e.message); });
+  } else if (name === 'settings' && !state.loaded.settings) {
+    loadSettings().catch(function (e) { showError(e.message); });
   } else if (name === 'stock') {
     // 支持 #stock/600519 深链接：只在代码变化时加载，避免重复请求
     const wanted = symbolFromHash();
@@ -1592,7 +1611,939 @@ async function loadLogContent(name) {
 }
 
 /* =======================================================================
- * 10. 初始化与事件绑定
+ * 10. Tab6 设置
+ * -----------------------------------------------------------------------
+ * 卡片 1/2：/api/settings 的 groups 接口驱动渲染，改动进 dirty 跟踪，
+ *           由吸底保存栏统一 POST /api/settings（只发改动过的 key）。
+ * 卡片 3：数据操作（POST /api/jobs），不入 dirty 跟踪。
+ * 卡片 4：计划任务（GET /api/tasks + POST /api/tasks/action）。
+ * 卡片 5：数据库与缓存（/api/db/backup、/api/db/backups、/api/cache/clear）。
+ * ======================================================================= */
+
+/** 未保存改动数量（按 key 去重） */
+function dirtyCount() {
+  return Object.keys(state.settings.dirty).length;
+}
+
+/** 卡片内提示条 HTML（ok 绿 / err 红 / warn 黄 / info 蓝） */
+function noteHTML(kind, text) {
+  return '<div class="set-note ' + kind + '">' + esc(text) + '</div>';
+}
+
+/** 最近一次数据操作的状态行（job id / 状态 / 类型） */
+function renderOpState(kind) {
+  const st = state.settings.lastJob[kind];
+  if (!st) return '';
+  const cls = st.status === 'failed' ? ' st-err' : (st.status === 'done' ? ' st-ok' : '');
+  return '最近任务 <span class="' + cls + '">#' + esc(st.id) + '</span>'
+       + ' · ' + esc(JOB_KIND_SHORT[st.kind] || st.kind || '--')
+       + ' · ' + esc(jobStatusText(st.status));
+}
+
+/** 任务状态 -> 纯文字 */
+function jobStatusText(s) {
+  if (s === 'running') return '运行中';
+  if (s === 'done') return '已完成';
+  if (s === 'failed') return '失败';
+  return s || '未知';
+}
+
+/* -------- 日期 / 代码输入解析 -------- */
+
+/** 今天往前 n 天的 YYYY-MM-DD（默认 30） */
+function isoDaysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - (n === undefined ? 30 : n));
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+/** 今天的 YYYY-MM-DD */
+function isoToday() {
+  return isoDaysAgo(0);
+}
+
+/** '600519,000001 600519' -> ['600519','000001']（去重、保持顺序） */
+function parseSymbols(text) {
+  const out = [];
+  String(text || '').split(/[\s,，、;；]+/).forEach(function (s) {
+    const t = s.trim().toUpperCase();
+    if (t && out.indexOf(t) < 0) out.push(t);
+  });
+  return out;
+}
+
+/**
+ * 把接口 item.type 归一化成实际的 <input type>。
+ * secret: true 的字段默认用密码框遮住。
+ */
+function inputTypeOf(item) {
+  if (item.type === 'select') return 'select';
+  if (item.type === 'int' || item.type === 'float') return 'number';
+  if (item.type === 'date') return 'date';
+  if (item.type === 'password') return 'password';
+  return item.secret ? 'password' : 'text';
+}
+
+/** 渲染单个 item 的输入控件（text / password / int / float / date / select） */
+function itemControlHTML(item) {
+  const key = String(item.key);
+  const id = 'set-f-' + key;
+  const value = item.value === null || item.value === undefined ? '' : String(item.value);
+  const ph = item.placeholder ? ' placeholder="' + esc(item.placeholder) + '"' : '';
+  const cls = 'input set-input' + (inputTypeOf(item) === 'password' ? ' password' : '');
+  const common = ' id="' + esc(id) + '" class="' + cls + '" data-key="' + esc(key) + '"'
+               + ' autocomplete="off" spellcheck="false"' + ph;
+
+  if (item.type === 'select') {
+    const choices = item.choices || [];
+    let opts = '';
+    let matched = false;
+    choices.forEach(function (c) {
+      const v = String(c.value);
+      if (v === value) matched = true;
+      opts += '<option value="' + esc(v) + '"' + (v === value ? ' selected' : '') + '>'
+            + esc(c.label === undefined || c.label === null ? v : c.label) + '</option>';
+    });
+    // 当前值不在 choices 里时补一个，避免显示错乱
+    if (value && !matched) {
+      opts = '<option value="' + esc(value) + '" selected>' + esc(value) + '（当前值）</option>' + opts;
+    }
+    if (!value) opts = '<option value="" selected>--</option>' + opts;
+    return '<select' + common + '>' + opts + '</select>';
+  }
+
+  if (item.type === 'int' || item.type === 'float') {
+    const min = (item.min === null || item.min === undefined) ? '' : ' min="' + esc(item.min) + '"';
+    const max = (item.max === null || item.max === undefined) ? '' : ' max="' + esc(item.max) + '"';
+    const step = (item.step !== null && item.step !== undefined && item.step !== '')
+      ? item.step
+      : (item.type === 'int' ? '1' : 'any');
+    return '<input type="number"' + common + min + max + ' step="' + esc(step) + '" value="' + esc(value) + '">';
+  }
+
+  const type = inputTypeOf(item);
+  const input = '<input type="' + type + '"' + common + ' value="' + esc(value) + '">';
+  const toggle = type === 'password'
+    ? '<button type="button" class="btn" data-pw="' + esc(id) + '">显示</button>'
+    : '';
+  if (!toggle) return input;
+  return '<div class="set-input-row">' + input + toggle + '</div>';
+}
+
+/** 渲染一个设置项行 */
+function renderItem(item) {
+  const key = String(item.key);
+  const help = item.help ? '<div class="set-help">' + esc(item.help) + '</div>' : '';
+  const envHint = item.in_file === false
+    ? '<span class="set-env-hint" title="该值来自环境变量，写入 .env 可能不生效">来自环境变量</span>'
+    : '';
+  return '<div class="set-row" data-row="' + esc(key) + '">'
+       +   '<div class="set-label">' + esc(item.label || key)
+       +     (item.required ? '<span class="set-req" title="必填">*</span>' : '')
+       +     envHint
+       +     (item.restart ? '<span class="badge badge-yellow">需重启</span>' : '')
+       +   '</div>'
+       +   '<div class="set-field">'
+       +     itemControlHTML(item)
+       +     help
+       +   '</div>'
+       + '</div>';
+}
+
+/** 渲染设置分组卡片（卡片 1 / 2；meta 里带按钮，所以放卡片头） */
+function renderSettingGroup(g, meta) {
+  meta = meta || {};
+  const items = g.items || [];
+  const actions = meta.actions
+    ? '<div class="head-actions">' + meta.actions + '</div>'
+    : '<span class="hint">' + esc(g.key || '') + '</span>';
+  return '<div class="card" data-group="' + esc(g.key || '') + '">'
+       +   '<div class="card-head">'
+       +     '<h2>' + esc(g.title || g.key || '设置') + '</h2>'
+       +     actions
+       +   '</div>'
+       +   '<div class="card-body">'
+       +     (g.desc ? '<p class="set-desc">' + esc(g.desc) + '</p>' : '')
+       +     (items.length
+               ? '<div class="set-form">' + items.map(renderItem).join('') + '</div>'
+               : emptyBox('该分组暂无配置项'))
+       +     (meta.extra || '')
+       +   '</div>'
+       + '</div>';
+}
+
+/** 设置页吸底保存栏（JS 生成，视图里不放静态节点，避免与其它页面互相干扰） */
+function saveBarHTML() {
+  return '<div id="set-savebar" class="savebar" hidden>'
+       +   '<span class="savebar-text" id="set-savebar-text"></span>'
+       +   '<span class="savebar-actions">'
+       +     '<button type="button" class="btn" id="set-btn-discard">放弃改动</button>'
+       +     '<button type="button" class="btn btn-primary" id="set-btn-save">保存</button>'
+       +   '</span>'
+       + '</div>';
+}
+
+/** 保存栏显隐与文案（只有存在未保存改动时才显示） */
+function updateSaveBar() {
+  const bar = $('#set-savebar');
+  if (!bar) return;
+  const n = dirtyCount();
+  const text = $('#set-savebar-text');
+  const save = $('#set-btn-save');
+  const discard = $('#set-btn-discard');
+  bar.hidden = n === 0;
+  if (text) text.textContent = '有 ' + n + ' 项未保存';
+  if (save) save.disabled = n === 0 || state.settings.busy;
+  if (discard) discard.disabled = state.settings.busy;
+}
+
+/** 从当前 DOM 读取控件值（密码框也是明文 value） */
+function readControlValue(key) {
+  const el = $('#set-f-' + key);
+  if (el) return el.value === null || el.value === undefined ? '' : String(el.value);
+  // 控件不在页面上（例如表单正在重渲染）时退回已记录的值
+  const v = state.settings.values[key];
+  return v === undefined || v === null ? '' : String(v);
+}
+
+/**
+ * 读取表单当前值（只读，不改动 state.settings.values 这个「已保存值」基线）。
+ * 返回 {key: 字符串值}
+ */
+function readFormValues() {
+  const out = {};
+  state.settings.groups.forEach(function (g) {
+    (g.items || []).forEach(function (it) {
+      if (!it || !it.key) return;
+      out[String(it.key)] = readControlValue(String(it.key));
+    });
+  });
+  return out;
+}
+
+/** 提交前校验 + 归一化（返回 {ok, values} 或 {ok:false, error}） */
+function collectFormValues() {
+  const s = state.settings;
+  const raw = readFormValues();
+  const values = {};
+  let error = null;
+
+  s.groups.forEach(function (g) {
+    (g.items || []).forEach(function (it) {
+      if (!it || !it.key) return;
+      const key = String(it.key);
+      const str = raw[key] === undefined || raw[key] === null ? '' : String(raw[key]).trim();
+
+      if (it.type === 'int') {
+        if (str === '') {
+          if (it.required) error = error || (it.label || key) + ' 不能为空';
+          values[key] = '';
+          return;
+        }
+        if (!/^-?\d+$/.test(str)) { error = error || (it.label || key) + ' 必须是整数'; return; }
+        const n = parseInt(str, 10);
+        if (it.min !== null && it.min !== undefined && n < Number(it.min)) {
+          error = error || (it.label || key) + ' 不能小于 ' + it.min; return;
+        }
+        if (it.max !== null && it.max !== undefined && n > Number(it.max)) {
+          error = error || (it.label || key) + ' 不能大于 ' + it.max; return;
+        }
+        values[key] = String(n);
+        return;
+      }
+
+      if (it.type === 'float') {
+        if (str === '') {
+          if (it.required) error = error || (it.label || key) + ' 不能为空';
+          values[key] = '';
+          return;
+        }
+        if (!isFinite(Number(str))) { error = error || (it.label || key) + ' 必须是数字'; return; }
+        const n = Number(str);
+        if (it.min !== null && it.min !== undefined && n < Number(it.min)) {
+          error = error || (it.label || key) + ' 不能小于 ' + it.min; return;
+        }
+        if (it.max !== null && it.max !== undefined && n > Number(it.max)) {
+          error = error || (it.label || key) + ' 不能大于 ' + it.max; return;
+        }
+        values[key] = str;                 // 原样提交（省得 0.50 被改写成 0.5 而误判为已改动）
+        return;
+      }
+
+      // text / password / date / select：原样提交，只校验必填
+      if (str === '' && it.required) error = error || (it.label || key) + ' 不能为空';
+      values[key] = str;
+    });
+  });
+
+  if (error) return { ok: false, error: error };
+  return { ok: true, values: values };
+}
+
+/** 比较 DOM 当前值与已保存值，刷新 dirty 集合与保存栏 */
+function recomputeDirty() {
+  const s = state.settings;
+  const dirty = {};
+  const byKey = {};
+  s.groups.forEach(function (g) {
+    (g.items || []).forEach(function (it) { if (it && it.key) byKey[it.key] = it; });
+  });
+
+  Object.keys(s.values).forEach(function (key) {
+    if (!byKey[key]) return;
+    const el = $('#set-f-' + key);
+    if (!el) return;                                   // 控件不在页面上（如正在重渲染）则忽略
+    if (String(el.value) !== String(s.values[key])) dirty[key] = true;
+  });
+
+  s.dirty = dirty;
+  Object.keys(byKey).forEach(function (key) {
+    const row = document.querySelector('.set-row[data-row="' + key + '"]');
+    if (row) row.classList.toggle('is-dirty', !!dirty[key]);
+  });
+  updateSaveBar();
+}
+
+/** 单个控件变更（300ms 防抖，不重渲染整表，避免丢焦点） */
+let settingsDirtyTimer = null;
+function onSettingChanged(key) {
+  if (settingsDirtyTimer) clearTimeout(settingsDirtyTimer);
+  settingsDirtyTimer = setTimeout(function () {
+    settingsDirtyTimer = null;
+    recomputeDirty();
+  }, 300);
+}
+
+/** 立即刷新 dirty（blur / change 时用） */
+function onSettingChangedNow() {
+  if (settingsDirtyTimer) { clearTimeout(settingsDirtyTimer); settingsDirtyTimer = null; }
+  recomputeDirty();
+}
+
+/** 应用 /api/settings 返回的 groups + config，并重置 dirty */
+function applySettingsData(data) {
+  const s = state.settings;
+  s.groups = data.groups || [];
+  s.config = data.config || {};
+  s.envPath = data.env_path || '';
+  s.values = {};
+  s.groups.forEach(function (g) {
+    (g.items || []).forEach(function (it) {
+      if (!it || !it.key) return;
+      s.values[it.key] = it.value === null || it.value === undefined ? '' : String(it.value);
+    });
+  });
+  s.dirty = {};
+}
+
+/**
+ * 渲染设置页的接口驱动部分（卡片 1 飞书推送 / 卡片 2 数据源与回填参数）
+ * @param {boolean} [reloadTasks] 是否顺带刷新计划任务（首次加载时）
+ */
+function renderSettings(reloadTasks) {
+  const box = $('#set-groups');
+  if (!box) return;
+
+  const s = state.settings;
+  let html;
+  if (!s.groups.length) {
+    html = '<div class="card"><div class="card-body">' + emptyBox('暂无配置项') + '</div></div>';
+  } else {
+    html = s.groups.map(function (g) {
+      if (g.key === 'feishu') {
+        return renderSettingGroup(g, {
+          actions: '<button type="button" class="btn" id="set-btn-test-feishu">测试推送</button>'
+                 + '<span class="hint">POST /api/settings/test-feishu</span>',
+          extra: '<div id="set-feishu-result"></div>'
+        });
+      }
+      if (g.key === 'datasource') {
+        return renderSettingGroup(g, {
+          actions: '<button type="button" class="btn" id="set-btn-probe">探测数据源健康度</button>'
+                 + '<span class="hint">POST /api/settings/probe-sources</span>',
+          extra: '<div id="set-probe-result"></div>'
+        });
+      }
+      return renderSettingGroup(g, {});
+    }).join('') + (s.envPath ? '<div class="set-help">配置文件：' + esc(s.envPath) + '</div>' : '');
+  }
+
+  // 吸底保存栏始终跟着分组一起重建，保证引用一直有效
+  box.innerHTML = html + saveBarHTML();
+
+  bindSettingsForm();
+  renderProbeResult();
+
+  if (reloadTasks) {
+    loadTasks().catch(function (e) { showError(e.message); });
+    loadDbInfo();
+    loadBackups().catch(function (e) { showError(e.message); });
+  }
+}
+
+/** 绑定卡片 1/2 表单的输入事件（每次重渲染后都要重绑） */
+function bindSettingsForm() {
+  const box = $('#set-groups');
+  if (!box) return;
+
+  // 文本 / 数字：input 事件 + 300ms 防抖（不重渲染，不丢焦点）
+  box.querySelectorAll('input[data-key]').forEach(function (el) {
+    const key = el.getAttribute('data-key');
+    // ⚠️ 这里**不能**把 el.value 写回 state.settings.values：
+    //    那个对象是「已保存值」基线，recomputeDirty() 正是拿 DOM 当前值和它比较
+    //    来判断有没有改动的。一旦在输入时就同步过去，两边永远相等，
+    //    dirty 恒为 0 —— 保存栏不出现、点保存也只会提示「没有需要保存的改动」。
+    //    基线的更新只发生在 applySettingsData()（加载和保存成功后）。
+    el.addEventListener('input', function () {
+      onSettingChanged(key);
+    });
+    // select / date / 失焦：立即更新
+    el.addEventListener('change', function () {
+      onSettingChangedNow();
+    });
+    el.addEventListener('blur', onSettingChangedNow);
+    // 回车不提交表单（防止误保存），保存必须点「保存」按钮
+    el.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') ev.preventDefault();
+    });
+  });
+
+  // 密码框的「显示 / 隐藏」
+  box.querySelectorAll('[data-pw]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const input = document.getElementById(btn.getAttribute('data-pw'));
+      if (!input) return;
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      btn.textContent = show ? '隐藏' : '显示';
+    });
+  });
+
+  // 测试推送
+  const tbtn = $('#set-btn-test-feishu');
+  if (tbtn) {
+    tbtn.addEventListener('click', function () { testFeishu(tbtn); });
+  }
+
+  // 探测数据源
+  const pbtn = $('#set-btn-probe');
+  if (pbtn) {
+    pbtn.addEventListener('click', function () { probeSources(pbtn); });
+  }
+}
+
+/* -------- 设置卡片 1：飞书测试推送 -------- */
+
+/** POST /api/settings/test-feishu（输入框里没填就交给后端用已保存的地址） */
+async function testFeishu(btn) {
+  const box = $('#set-feishu-result');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '发送中…'; }
+  if (box) box.innerHTML = '<div class="set-note info">正在发送测试卡片…</div>';
+
+  try {
+    const body = {};
+    const el = $('#set-f-FEISHU_WEBHOOK_URL');
+    const url = el ? String(el.value || '').trim() : '';
+    if (url) body.webhook_url = url;
+    const data = await api('/api/settings/test-feishu', { method: 'POST', body: body });
+    const msg = data.message || '测试卡片已发送';
+    if (box) box.innerHTML = noteHTML('ok', msg + (data.webhook ? '（' + data.webhook + '）' : ''));
+    showToast(msg, 'ok');
+  } catch (e) {
+    if (box) box.innerHTML = noteHTML('err', '测试推送失败：' + e.message);
+    showError('测试推送失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old || '测试推送'; }
+  }
+}
+
+/* -------- 设置卡片 2：数据源健康度探测 -------- */
+
+/** POST /api/settings/probe-sources（可能要 5~20 秒，按钮显示「探测中…」并禁用） */
+async function probeSources(btn) {
+  const box = $('#set-probe-result');
+  if (btn) { btn.disabled = true; btn.textContent = '探测中…'; }
+  if (box) box.innerHTML = '<div class="set-note info">正在逐个探测数据源，最多可能要 20 秒，请稍候…</div>';
+
+  try {
+    const data = await api('/api/settings/probe-sources', { method: 'POST', body: {} });
+    state.settings.probe = data;
+    renderProbeResult();
+    const healthy = data.healthy || [];
+    showToast('探测完成，可用 ' + healthy.length + ' 个数据源', healthy.length ? 'ok' : 'err');
+  } catch (e) {
+    state.settings.probe = null;
+    if (box) box.innerHTML = noteHTML('err', '探测失败：' + e.message);
+    showError('探测失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '探测数据源健康度'; }
+  }
+}
+
+/** 渲染数据源探测结果（源名 / 可用与否 / 耗时 / 错误） */
+function renderProbeResult() {
+  const box = $('#set-probe-result');
+  if (!box) return;
+  const data = state.settings.probe;
+  if (!data) { box.innerHTML = ''; return; }
+
+  const rows = data.results || [];
+  const healthy = data.healthy || [];
+  const okN = rows.filter(function (r) { return r && r.ok; }).length;
+
+  const head = '<div class="set-note ' + (okN ? 'ok' : 'err') + '">'
+             +   '健康度：可用 ' + fmt.num(okN) + ' / ' + fmt.num(rows.length)
+             +   (healthy.length ? '（' + esc(healthy.join(' / ')) + '）' : '（当前没有可用的数据源）')
+             + '</div>';
+
+  const tags = rows.length
+    ? '<div class="probe-map">' + rows.map(function (r) {
+        const ok = r && r.ok === true;
+        const ms = (r && r.ms !== null && r.ms !== undefined) ? (fmt.num(r.ms) + ' ms') : '';
+        const err = (r && r.error) ? ' · ' + esc(String(r.error)) : '';
+        return '<span class="probe-tag ' + (ok ? 'ok' : 'bad') + '" title="' + esc(String((r && r.source) || '') + err) + '">'
+             +   '<span class="src">' + esc((r && (r.label || r.source)) || '--') + '</span>'
+             +   '<span class="badge ' + (ok ? 'badge-green' : 'badge-red') + '">' + (ok ? '可用' : '不可用') + '</span>'
+             +   (ms ? '<span class="ms">' + esc(ms) + '</span>' : '')
+             +   (r && r.error ? '<span class="err">' + esc(String(r.error)) + '</span>' : '')
+             + '</span>';
+      }).join('') + '</div>'
+    : emptyBox('没有探测到任何数据源', true);
+
+  box.innerHTML = head + tags;
+}
+
+/* -------- 设置卡片 3：数据操作 -------- */
+
+/** 统一的 /api/jobs 提交 + 状态展示 */
+async function submitJobPayload(payload, btn, opKey) {
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api('/api/jobs', { method: 'POST', body: payload });
+    const job = data.job;
+    if (job && job.id) {
+      state.jobs[job.id] = job;
+      if (job.status === 'running') startPoll(job.id);
+      state.loaded.jobs = true;
+      renderJobs();
+      state.settings.lastJob[opKey] = { id: job.id, kind: job.kind || payload.kind, status: job.status };
+      showToast('任务已启动：' + job.id + '，进度请到「运行与日志」页查看', 'ok');
+    } else {
+      state.settings.lastJob[opKey] = { id: '(未知)', kind: payload.kind, status: 'running' };
+      showToast('任务已启动，进度请到「运行与日志」页查看', 'ok');
+    }
+    renderOpStates();
+  } catch (e) {
+    showError('提交任务失败：' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/** 刷新 4 个操作块下方的「最近任务」状态行 */
+function renderOpStates() {
+  document.querySelectorAll('#view-settings .op-block[data-op]').forEach(function (blk) {
+    const box = blk.querySelector('[data-op-state]');
+    if (box) box.innerHTML = renderOpState(blk.getAttribute('data-op'));
+  });
+}
+
+/** 数据操作 1：回填当日最新数据（增量，最快） */
+function opSync(btn) {
+  return submitJobPayload({ kind: 'sync' }, btn, 'sync');
+}
+
+/** 数据操作 2：补齐全市场缺口 */
+function opBackfill(btn) {
+  return submitJobPayload({ kind: 'backfill' }, btn, 'backfill');
+}
+
+/** 数据操作 3：指定股票整只重拉（会先删历史，必须二次确认） */
+function opReload(btn) {
+  const el = $('#set-reload-symbols');
+  const symbols = parseSymbols(el ? el.value : '');
+  if (!symbols.length) {
+    showToast('请先填写股票代码，如 600519,000001', 'err');
+    if (el) el.focus();
+    return Promise.resolve();
+  }
+  if (!window.confirm('「整只重拉」会先删除这 ' + symbols.length + ' 只股票的全部历史数据（'
+      + symbols.join('、') + '），再重新抓取。\n\n确定继续吗？')) {
+    return Promise.resolve();
+  }
+  return submitJobPayload({ kind: 'reload', symbols: symbols }, btn, 'reload');
+}
+
+/** 数据操作 4：指定日期区间补数据（股票留空 = 全市场） */
+function opRange(btn) {
+  const sEl = $('#set-range-start');
+  const eEl = $('#set-range-end');
+  const start = sEl ? String(sEl.value || '').trim() : '';
+  const end = eEl ? String(eEl.value || '').trim() : '';
+  if (!start || !end) {
+    showToast('请选择开始日期和结束日期', 'err');
+    return Promise.resolve();
+  }
+  if (start > end) {
+    showToast('开始日期不能晚于结束日期', 'err');
+    return Promise.resolve();
+  }
+  const symbols = parseSymbols($('#set-range-symbols') ? $('#set-range-symbols').value : '');
+  const payload = { kind: 'backfill', start: start, end: end };
+  if (symbols.length) payload.symbols = symbols;
+  return submitJobPayload(payload, btn, 'range');
+}
+
+/* -------- 设置卡片 4：计划任务 -------- */
+
+/** GET /api/tasks 并渲染表格 */
+async function loadTasks() {
+  const data = await api('/api/tasks');
+  renderTasks(data.tasks || []);
+}
+
+/** 渲染计划任务表格（任务名 / 状态 / 下次运行 / 上次运行 / 上次结果 / 操作） */
+function renderTasks(tasks) {
+  const box = $('#set-tasks-body');
+  if (!box) return;
+
+  if (!tasks.length) {
+    box.innerHTML = emptyBox('暂无计划任务');
+    return;
+  }
+
+  box.innerHTML = '<div class="table-wrap"><table class="tbl"><thead><tr>'
+    +   '<th>任务名</th><th>状态</th><th>下次运行</th><th>上次运行</th><th>上次结果</th><th>操作</th>'
+    + '</tr></thead><tbody>'
+    + tasks.map(function (t) {
+        const name = String(t.name || '');
+        return '<tr>'
+          + '<td>' + esc(name) + '</td>'
+          + '<td>' + taskStateBadge(t.state) + '</td>'
+          + '<td class="num">' + esc(fmt.dt(t.next_run)) + '</td>'
+          + '<td class="num">' + esc(fmt.dt(t.last_run)) + '</td>'
+          + '<td>' + taskResultCell(t.last_result, t.last_result_text) + '</td>'
+          + '<td><span class="head-actions">'
+          +   '<button type="button" class="btn" data-task="' + esc(name) + '" data-taction="enable">启用</button>'
+          +   '<button type="button" class="btn" data-task="' + esc(name) + '" data-taction="disable">禁用</button>'
+          +   '<button type="button" class="btn" data-task="' + esc(name) + '" data-taction="run">立即运行</button>'
+          + '</span></td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table></div>';
+}
+
+/** POST /api/tasks/action：启用 / 禁用 / 立即运行 */
+async function taskAction(name, action, btn) {
+  if (!name) return;
+  if (action === 'run' && !window.confirm('「立即运行」会真的完整跑一遍任务，并把选股结果推送到飞书。\n\n确定现在运行「' + name + '」吗？')) {
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api('/api/tasks/action', { method: 'POST', body: { name: name, action: action } });
+    if (data.tasks) renderTasks(data.tasks);
+    showToast(data.message || '操作已完成', 'ok');
+    if (action === 'run') {
+      // 任务刚被触发，顺带刷新一次任务列表（状态会变成「运行中」）
+      setTimeout(function () { loadTasks().catch(function () { /* 静默 */ }); }, 1200);
+    }
+  } catch (e) {
+    showError('任务操作失败：' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* -------- 设置卡片 5：数据库与缓存 -------- */
+
+/** 数据库信息：优先用 /api/overview 的 db，其次用 settings 的 config.db_path */
+function loadDbInfo() {
+  const box = $('#set-db-info');
+  if (!box) return;
+
+  const db = (state.overview && state.overview.db) || {};
+  const cfg = state.settings.config || {};
+  const path = db.path || cfg.db_path || '--';
+
+  const rows = [
+    ['数据库路径', path],
+    ['数据库大小', db.size_mb === undefined || db.size_mb === null ? '--（点右上角刷新）' : fmt.size(db.size_mb)],
+    ['股票数', db.symbols === undefined || db.symbols === null ? '--' : fmt.num(db.symbols)],
+    ['总行数', db.rows === undefined || db.rows === null ? '--' : fmt.num(db.rows)],
+    ['数据区间', (db.min_date || db.max_date)
+        ? (fmt.date(db.min_date) + ' ~ ' + fmt.date(db.max_date)) : '--'],
+    ['数据源顺序', cfg.auto_source_order || '--']
+  ];
+
+  box.innerHTML = rows.map(function (r) {
+    return '<div class="kv-row">'
+         +   '<span class="kv-k">' + esc(r[0]) + '</span>'
+         +   '<span class="kv-v mono" title="' + esc(String(r[1])) + '">' + esc(String(r[1])) + '</span>'
+         + '</div>';
+  }).join('');
+
+  // overview 里没有数据库信息时补拉一次（失败不影响其它卡片）。
+  // 注意不能写 `&& !state.inflight.overview`：header 也会发同一个请求，
+  // 一旦它正在飞就直接跳过补拉，这几行就永远停在「--（点右上角刷新）」了。
+  // loadOverview() 内部会复用在飞的 promise，所以这里无脑调 + then 重渲染即可。
+  if (!state.overview) {
+    loadOverview()
+      .then(function () { loadDbInfo(); })
+      .catch(function () { /* 静默 */ });
+  }
+}
+
+/** POST /api/db/backup，成功后提示文件名与大小并刷新备份列表 */
+async function backupDb(btn) {
+  const box = $('#set-db-result');
+  if (btn) { btn.disabled = true; btn.textContent = '备份中…'; }
+  if (box) box.innerHTML = '<div class="set-note info">正在备份数据库，大库可能要一会儿…</div>';
+
+  try {
+    const data = await api('/api/db/backup', { method: 'POST', body: {} });
+    const name = data.file || data.name || '(未知文件)';
+    const size = (data.size_mb === null || data.size_mb === undefined) ? '' : ('，' + fmt.size(data.size_mb));
+    const kept = (data.kept === null || data.kept === undefined) ? '' : ('，保留最近 ' + fmt.num(data.kept) + ' 份');
+    if (box) {
+      box.innerHTML = noteHTML('ok', '备份完成：' + name + size + kept
+        + (data.path ? '（' + data.path + '）' : ''));
+    }
+    showToast('备份完成：' + name + size, 'ok');
+    await loadBackups();
+  } catch (e) {
+    if (box) box.innerHTML = noteHTML('err', '备份失败：' + e.message);
+    showError('备份失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '备份数据库'; }
+  }
+}
+
+/** GET /api/db/backups 并渲染备份文件列表 */
+async function loadBackups() {
+  const data = await api('/api/db/backups');
+  state.settings.backups = data.files || [];
+  renderBackups();
+}
+
+/** 渲染备份文件列表 */
+function renderBackups() {
+  const box = $('#set-backups');
+  if (!box) return;
+  const files = state.settings.backups || [];
+
+  if (!files.length) {
+    box.innerHTML = emptyBox('暂无备份文件', true);
+    return;
+  }
+
+  box.innerHTML = '<div class="backup-list">' + files.map(function (f) {
+    return '<div class="backup-row" title="' + esc(String(f.path || '')) + '">'
+         +   '<span class="bk-name">' + esc(f.name || '--') + '</span>'
+         +   '<span class="bk-time">' + esc(fmt.dt(f.mtime)) + '</span>'
+         +   '<span class="bk-size">' + esc(fmt.size(f.size_mb)) + '</span>'
+         + '</div>';
+  }).join('') + '</div>';
+}
+
+/** POST /api/cache/clear：清理 4 类内存缓存 */
+async function clearCache(btn) {
+  const box = $('#set-db-result');
+  const targets = ['signals', 'jobs', 'names', 'coverage'];
+  if (btn) { btn.disabled = true; btn.textContent = '清理中…'; }
+  if (box) box.innerHTML = '<div class="set-note info">正在清理缓存…</div>';
+
+  try {
+    const data = await api('/api/cache/clear', { method: 'POST', body: { targets: targets } });
+    const cleared = data.cleared || [];
+    const msg = data.message || ('已清理 ' + cleared.length + ' 项缓存');
+    if (box) {
+      box.innerHTML = noteHTML('ok', msg + (cleared.length ? '：' + cleared.join('、') : '（没有需要清理的缓存）'));
+    }
+    showToast(msg, 'ok');
+    // 缓存清掉后，已加载的数据下次进入要重新拉
+    cleared.forEach(function (t) {
+      if (t === 'signals') state.loaded.signals = false;
+      if (t === 'coverage') state.loaded.coverage = false;
+      if (t === 'jobs') state.loaded.jobs = false;
+    });
+  } catch (e) {
+    if (box) box.innerHTML = noteHTML('err', '清理缓存失败：' + e.message);
+    showError('清理缓存失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '清理缓存'; }
+  }
+}
+
+/* -------- 设置页加载 / 保存 / 放弃 -------- */
+
+/** 加载 /api/settings 并渲染（首次进入 tab 或放弃改动时调用） */
+async function loadSettings(force) {
+  if (state.loaded.settings && !force) return;
+  if (state.settings.busy) return;
+  state.settings.busy = true;
+  try {
+    const data = await api('/api/settings');
+    applySettingsData(data);
+    state.loaded.settings = true;
+    renderSettings(true);
+    updateSaveBar();
+  } finally {
+    state.settings.busy = false;
+  }
+}
+
+/** 保存：只提交改动过的 key */
+async function saveSettings(btn) {
+  const s = state.settings;
+  if (s.busy) return;
+  if (!dirtyCount()) { showToast('没有需要保存的改动'); return; }
+
+  const res = collectFormValues();
+  if (!res.ok) { showError(res.error); return; }
+
+  const values = {};
+  Object.keys(s.dirty).forEach(function (key) {
+    if (res.values[key] !== undefined) values[key] = res.values[key];
+  });
+  if (!Object.keys(values).length) { showToast('没有需要保存的改动'); return; }
+
+  s.busy = true;
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  const fbox = $('#set-feishu-result');
+
+  try {
+    const data = await api('/api/settings', { method: 'POST', body: { values: values } });
+
+    // 用响应里的 groups / config 重新渲染（相当于重新加载当前值），清掉 dirty
+    applySettingsData(data);
+    state.loaded.settings = true;
+    renderSettings(false);
+    updateSaveBar();
+    showToast('已保存', 'ok');
+
+    const warnings = data.warnings || [];
+    const applied = data.applied || [];
+    if (warnings.length) {
+      // 黄色提示条 + 逐条 toast
+      const box = $('#set-feishu-result');
+      if (box) {
+        box.innerHTML = noteHTML('warn', '已保存，但有 ' + warnings.length + ' 条提醒：'
+          + '<br>· ' + warnings.map(esc).join('<br>· '));
+      }
+      warnings.forEach(function (w) { showToast(w); });
+    } else if (applied.length && fbox) {
+      fbox.innerHTML = noteHTML('ok', '已更新：' + applied.join('、'));
+    }
+    if (data.restart_required) showToast('部分改动需要重启服务后生效');
+  } catch (e) {
+    showError('保存失败：' + e.message);
+  } finally {
+    s.busy = false;
+    if (btn) btn.textContent = '保存';
+    updateSaveBar();
+  }
+}
+
+/** 放弃改动：重新拉一次 /api/settings 覆盖当前值 */
+async function discardSettings(btn) {
+  if (state.settings.busy) return;
+  if (btn) btn.disabled = true;
+  try {
+    state.loaded.settings = false;
+    await loadSettings(true);
+    showToast('已放弃未保存的改动');
+  } catch (e) {
+    showError('放弃改动失败：' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    updateSaveBar();
+  }
+}
+
+/** 绑定设置页所有事件（入口调用一次；动态部分用事件委托） */
+function bindSettingsEvents() {
+  /* ---- 卡片 3：4 个数据操作（事件委托，便于后续调整 DOM） ---- */
+  const ops = $('#view-settings');
+  if (ops) {
+    ops.addEventListener('click', function (ev) {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('[data-action]') : null;
+      if (!btn) return;
+      const act = btn.getAttribute('data-action');
+      if (act === 'op-sync') opSync(btn).catch(function (e) { showError(e.message); });
+      else if (act === 'op-backfill') opBackfill(btn).catch(function (e) { showError(e.message); });
+      else if (act === 'op-reload') opReload(btn).catch(function (e) { showError(e.message); });
+      else if (act === 'op-range') opRange(btn).catch(function (e) { showError(e.message); });
+    });
+  }
+
+  /* ---- 卡片 3：日期区间默认值（今天往前 30 天 ~ 今天） ---- */
+  const startEl = $('#set-range-start');
+  const endEl = $('#set-range-end');
+  if (startEl && !startEl.value) startEl.value = isoDaysAgo(30);
+  if (endEl && !endEl.value) endEl.value = isoToday();
+
+  /* ---- 卡片 3：操作块里的输入框回车不要误提交任务 ---- */
+  ['#set-reload-symbols', '#set-range-start', '#set-range-end', '#set-range-symbols'].forEach(function (sel) {
+    const el = $(sel);
+    if (!el) return;
+    el.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        if (sel === '#set-reload-symbols') opReload($('[data-action="op-reload"]'));
+        else if (sel === '#set-range-symbols') opRange($('[data-action="op-range"]'));
+      }
+    });
+  });
+
+  /* ---- 卡片 4：计划任务（事件委托） ---- */
+  const tasksBody = $('#set-tasks-body');
+  if (tasksBody) {
+    tasksBody.addEventListener('click', function (ev) {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('[data-taction]') : null;
+      if (!btn) return;
+      taskAction(btn.getAttribute('data-task'), btn.getAttribute('data-taction'), btn)
+        .catch(function (e) { showError(e.message); });
+    });
+  }
+  const tasksRefresh = $('#set-tasks-refresh');
+  if (tasksRefresh) {
+    tasksRefresh.addEventListener('click', function () {
+      loadTasks().catch(function (e) { showError(e.message); });
+    });
+  }
+
+  /* ---- 卡片 5：数据库与缓存 ---- */
+  const btnBackup = $('#set-btn-backup');
+  if (btnBackup) btnBackup.addEventListener('click', function () { backupDb(btnBackup); });
+
+  const btnClear = $('#set-btn-clear-cache');
+  if (btnClear) btnClear.addEventListener('click', function () { clearCache(btnClear); });
+
+  const btnBkRefresh = $('#set-btn-backups-refresh');
+  if (btnBkRefresh) {
+    btnBkRefresh.addEventListener('click', function () {
+      loadBackups().catch(function (e) { showError(e.message); });
+    });
+  }
+
+  /* ---- 吸底保存栏（节点由 renderSettings 生成，用委托保证一直可用）---- */
+  const setView = $('#view-settings');
+  if (setView) {
+    setView.addEventListener('click', function (ev) {
+      const t = ev.target;
+      if (!t || !t.id) return;
+      if (t.id === 'set-btn-save') saveSettings(t);
+      else if (t.id === 'set-btn-discard') discardSettings(t);
+    });
+  }
+
+  updateSaveBar();
+}
+
+/* =======================================================================
+ * 11. 初始化与事件绑定
  * ======================================================================= */
 
 /** 刷新当前 tab（顶部「刷新」按钮） */
@@ -1620,6 +2571,13 @@ function refreshCurrent() {
     loadCoverage().catch(fail);
   } else if (t === 'jobs') {
     loadJobs().catch(fail);
+  } else if (t === 'settings') {
+    // 刷新 = 重新拉配置 + 计划任务（未保存的改动会被覆盖）
+    state.loaded.settings = false;
+    loadSettings(true).catch(fail);
+    loadTasks().catch(fail);
+    loadBackups().catch(fail);
+    loadDbInfo();
   }
   // 顶部 Header 的日期/股票数始终以 overview 为准
   if (t !== 'overview') loadOverview(true).catch(function () { /* 静默 */ });
@@ -1827,6 +2785,7 @@ function bindEvents() {
 /** 入口 */
 function init() {
   bindEvents();
+  bindSettingsEvents();
   const t = tabFromHash();
   // 首次加载：switchTab 会按 tab 懒加载（总览 tab 时即拉 /api/overview）
   switchTab(t);

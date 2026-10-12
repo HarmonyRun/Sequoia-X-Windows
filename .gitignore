@@ -16,10 +16,13 @@ ENV/
 .vscode/
 .kiro
 
-# 数据库文件（含备份与 Web 工作台的运行时缓存）
-data/*.db
-data/*.db-*
-data/*.json
+# 数据库、备份与运行时缓存（整个 data/ 都不入版本库）
+# 注意不能只写 data/*.db：匹配不到 data/backups/ 下面的备份文件
+data/
+
+# .env 的备份与临时文件（Web 工作台改配置时产生）
+.env.bak
+.env.tmp
 
 # 环境变量
 .env

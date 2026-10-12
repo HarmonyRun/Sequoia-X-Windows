@@ -25,7 +25,7 @@
 </header>
 
 <!-- =====================================================================
-     Tab 导航（URL hash 路由：#overview / #signals / #stock / #coverage / #jobs）
+     Tab 导航（URL hash 路由：#overview / #signals / #stock / #coverage / #jobs / #settings）
      ===================================================================== -->
 <nav class="tabs" id="tabs">
   <a class="tab" href="#overview" data-tab="overview">总览</a>
@@ -33,6 +33,7 @@
   <a class="tab" href="#stock"    data-tab="stock">个股</a>
   <a class="tab" href="#coverage" data-tab="coverage">数据覆盖</a>
   <a class="tab" href="#jobs"     data-tab="jobs">运行与日志</a>
+  <a class="tab" href="#settings" data-tab="settings">设置</a>
 </nav>
 
 <!-- 全局错误条 / 轻提示 -->
@@ -216,6 +217,121 @@
       </div>
       <div class="card-body" id="logs-panel"></div>
     </div>
+  </section>
+
+  <!-- ===================================================================
+       Tab 6 —— 设置
+       卡片 1 / 2 由 /api/settings 的 groups 驱动渲染（可编辑，带吸底保存栏）
+       卡片 3 / 4 / 5 是固定 UI 的操作块，不参与 dirty 跟踪
+       =================================================================== -->
+  <section id="view-settings" class="view" data-view="settings" hidden>
+    <!-- 卡片 1 / 2：由 JS 渲染到 #set-groups（飞书推送 + 数据源与回填参数） -->
+    <div id="set-groups"></div>
+
+    <!-- 卡片 3：数据操作 -->
+    <div class="card">
+      <div class="card-head">
+        <h2>数据操作</h2>
+        <span class="hint">POST /api/jobs</span>
+      </div>
+      <div class="card-body">
+        <div class="op-grid">
+
+          <!-- 1. 回填当日最新数据 -->
+          <div class="op-block" data-op="sync">
+            <div class="op-title">回填当日最新数据<span class="badge badge-grey">同步</span></div>
+            <p class="op-desc">只补最新交易日的缺口，已是最新的股票会跳过。</p>
+            <div class="op-row">
+              <button type="button" class="btn btn-primary" data-action="op-sync">开始</button>
+            </div>
+            <div class="op-state" data-op-state></div>
+          </div>
+
+          <!-- 2. 补齐全市场缺口 -->
+          <div class="op-block" data-op="backfill">
+            <div class="op-title">补齐全市场缺口<span class="badge badge-grey">回填</span></div>
+            <p class="op-desc">全市场扫描，自动跳过已是最新的股票，自动按数据源顺序换源续填。耗时较长。</p>
+            <div class="op-row">
+              <button type="button" class="btn btn-primary" data-action="op-backfill">开始</button>
+            </div>
+            <div class="op-state" data-op-state></div>
+          </div>
+
+          <!-- 3. 指定股票整只重拉 -->
+          <div class="op-block" data-op="reload">
+            <div class="op-title">指定股票整只重拉<span class="badge badge-red">危险</span></div>
+            <p class="op-desc">
+              <b class="err-text">会先删掉这些股票的全部历史，再重新拉取。</b>
+              只在怀疑某只股票数据不对时才用；正常补数据请用上面的「回填当日最新数据」。
+            </p>
+            <div class="op-row">
+              <input class="input" type="text" id="set-reload-symbols" autocomplete="off" spellcheck="false"
+                     placeholder="多个代码用逗号或空格分隔，如 600519,000001">
+              <button type="button" class="btn" data-action="op-reload">开始</button>
+            </div>
+            <div class="op-state" data-op-state></div>
+          </div>
+
+          <!-- 4. 指定日期区间补数据 -->
+          <div class="op-block" data-op="range">
+            <div class="op-title">指定日期区间补数据<span class="badge badge-grey">补数据</span></div>
+            <p class="op-desc">
+              只补不删，已有的行会被覆盖。股票留空 = 全市场（比较慢）。
+            </p>
+            <div class="op-row">
+              <input class="input" type="date" id="set-range-start">
+              <span class="op-arrow">→</span>
+              <input class="input" type="date" id="set-range-end">
+            </div>
+            <div class="op-row">
+              <input class="input" type="text" id="set-range-symbols" autocomplete="off" spellcheck="false"
+                     placeholder="股票代码，留空 = 全市场（如 600519,000001）">
+              <button type="button" class="btn btn-primary" data-action="op-range">开始</button>
+            </div>
+            <div class="op-state" data-op-state></div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- 卡片 4：计划任务 -->
+    <div class="card">
+      <div class="card-head">
+        <h2>计划任务</h2>
+        <div class="head-actions">
+          <button type="button" class="btn" id="set-tasks-refresh">刷新</button>
+        </div>
+      </div>
+      <div class="card-body" id="set-tasks-body"></div>
+    </div>
+
+    <!-- 卡片 5：数据库与缓存 -->
+    <div class="card">
+      <div class="card-head">
+        <h2>数据库与缓存</h2>
+        <div class="head-actions">
+          <button type="button" class="btn btn-primary" id="set-btn-backup">备份数据库</button>
+          <button type="button" class="btn" id="set-btn-clear-cache">清理缓存</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="kv" id="set-db-info"></div>
+
+        <div class="set-sub">
+          <div class="set-sub-head">
+            <h3>备份文件</h3>
+            <div class="head-actions">
+              <button type="button" class="btn" id="set-btn-backups-refresh">刷新</button>
+            </div>
+          </div>
+          <div id="set-backups"></div>
+        </div>
+
+        <div id="set-db-result"></div>
+      </div>
+    </div>
+    <!-- 吸底保存栏由 app.js 的 saveBarHTML() 生成在 #set-groups 之后 -->
   </section>
 
 </main>

@@ -10,7 +10,8 @@
  *   7. Tab3 个股（K 线图 / tooltip）
  *   8. Tab4 数据覆盖
  *   9. Tab5 运行与日志
- *  10. 响应式
+ *  10. Tab6 设置（表单 / 数据操作 / 计划任务 / 数据库与缓存 / 吸底保存栏）
+ *  11. 响应式
  * ========================================================================= */
 
 /* ============================ 1. 变量与基础 ============================ */
@@ -631,9 +632,170 @@ table.tbl tr.row-warn:hover td { background: rgba(210,153,34,.16); }
   word-break: break-all;
 }
 
-/* =========================== 10. 响应式 =============================== */
+/* =========================== 10. Tab6 设置 ============================= */
+/* 设置分组卡片（由 /api/settings 的 groups 渲染） */
+#set-groups { display: flex; flex-direction: column; gap: 16px; }
+
+.set-desc { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
+.set-desc:last-child { margin-bottom: 0; }
+.set-desc code { color: var(--primary); font-size: 12px; }
+
+/* 表单行：左侧标签 + 讲解，右侧控件 */
+.set-form { display: flex; flex-direction: column; gap: 2px; }
+
+.set-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 300px) minmax(0, 1fr);
+  gap: 8px 20px;
+  align-items: start;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-2);
+}
+.set-row:last-child { border-bottom: 0; }
+.set-row.is-dirty { background: rgba(210,153,34,.06); }
+.set-row.is-dirty .set-label { color: var(--warn); }
+
+.set-label {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.set-req { color: var(--up); font-weight: 700; }
+
+.set-field { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.set-input-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+
+.set-input { width: 100%; min-width: 0; max-width: 520px; }
+select.set-input { cursor: pointer; }
+.set-input.password { font-family: var(--mono); letter-spacing: .5px; }
+
+.set-help { color: var(--muted-2); font-size: 12px; word-break: break-all; }
+.set-env-hint { color: var(--warn); font-size: 11px; }
+
+/* 卡片内的结果 / 警告提示条 */
+.set-note {
+  margin-top: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+  line-height: 1.7;
+  word-break: break-all;
+}
+.set-note.ok   { border-color: rgba(63,185,80,.5);  background: rgba(63,185,80,.09);  color: #7ee787; }
+.set-note.err  { border-color: rgba(248,81,73,.5);  background: rgba(248,81,73,.09);  color: #ffb3ae; }
+.set-note.warn { border-color: rgba(210,153,34,.5); background: rgba(210,153,34,.09); color: #e3b341; }
+.set-note.info { border-color: rgba(88,166,255,.5); background: rgba(88,166,255,.07); color: #a5d6ff; }
+.set-note b { color: var(--text); }
+
+/* 数据源探测结果：源名 / 可用 / 耗时 */
+.probe-map { display: flex; flex-wrap: wrap; gap: 8px; }
+.probe-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #21262d;
+  font-size: 12.5px;
+}
+.probe-tag .src { font-family: var(--mono); color: var(--text); }
+.probe-tag .ms { font-family: var(--mono); color: var(--muted); font-size: 11.5px; }
+.probe-tag .err { color: var(--up); font-size: 11.5px; }
+.probe-tag.ok  { border-color: rgba(63,185,80,.45); }
+.probe-tag.bad { border-color: rgba(248,81,73,.45); }
+
+/* 数据操作：4 个小块 */
+.op-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
+  gap: 14px;
+}
+.op-block {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  padding: 13px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 0;
+}
+.op-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.op-desc { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.7; }
+.op-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.op-row .input { flex: 1 1 170px; min-width: 130px; }
+.op-arrow { color: var(--muted-2); }
+.op-state {
+  color: var(--muted-2);
+  font-size: 11.5px;
+  font-family: var(--mono);
+  border-top: 1px dashed var(--border-2);
+  padding-top: 7px;
+  min-height: 15px;
+  word-break: break-all;
+}
+.op-state .st-err { color: var(--up); }
+.op-state .st-ok  { color: var(--down); }
+
+/* 卡片 5：备份列表等子区块 */
+.set-sub { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-2); }
+.set-sub-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.set-sub-head h3 { font-size: 13px; }
+.backup-list { display: flex; flex-direction: column; gap: 5px; }
+.backup-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  background: rgba(255,255,255,.012);
+  font-size: 12.5px;
+}
+.backup-row .bk-name { font-family: var(--mono); color: var(--text); word-break: break-all; }
+.backup-row .bk-size { font-family: var(--mono); color: var(--primary); margin-left: auto; }
+.backup-row .bk-time { font-family: var(--mono); color: var(--muted-2); }
+
+/* 吸底保存栏（常驻 DOM，只有存在未保存改动时由 JS 取消 hidden） */
+#view-settings #set-savebar {
+  position: sticky;
+  bottom: 0;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: -4px;
+  padding: 11px 16px;
+  border: 1px solid rgba(210,153,34,.6);
+  border-radius: var(--radius);
+  background: rgba(22,27,34,.97);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 -8px 24px rgba(0,0,0,.45);
+}
+.savebar-text { color: var(--warn); font-size: 13px; font-weight: 600; }
+.savebar-actions { display: flex; align-items: center; gap: 10px; }
+
+/* =========================== 11. 响应式 =============================== */
 @media (max-width: 900px) {
   .main { padding: 14px 12px 60px; }
+  .set-row { grid-template-columns: 1fr; gap: 5px; }
+  .set-input { max-width: 100%; }
   .topbar { padding: 9px 12px; }
   .tabs { padding: 0 8px; top: 51px; }
   .error-bar { margin: 10px 12px 0; }

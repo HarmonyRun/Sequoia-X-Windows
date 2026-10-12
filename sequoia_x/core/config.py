@@ -106,6 +106,15 @@ class Settings(BaseSettings):
 _settings: Settings | None = None
 
 
+def reset_settings() -> None:
+    """清掉单例缓存，让下次 ``get_settings()`` 重新从 .env 读一遍。
+
+    Web 工作台改了 .env 之后必须调这个，否则进程里缓存的老配置会一直生效。
+    """
+    global _settings
+    _settings = None
+
+
 def get_settings() -> Settings:
     """返回全局 Settings 单例。
 

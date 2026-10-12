@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -38,13 +39,15 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(REPO / ".env")
 
-from sequoia_x.core.config import get_settings  # noqa: E402
+from sequoia_x.core.config import get_settings, reset_settings  # noqa: E402
 from sequoia_x.data.engine import DataEngine  # noqa: E402
 from sequoia_x.pipeline import run_strategies, strategy_meta  # noqa: E402
+from webui import envstore  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DATA_DIR = REPO / "data"
 LOGS_DIR = REPO / "logs"
+BACKUP_DIR = DATA_DIR / "backups"
 SIGNALS_CACHE = DATA_DIR / "signals_cache.json"
 NAME_CACHE = DATA_DIR / "name_cache.json"
 JOBS_FILE = DATA_DIR / "jobs_history.json"
@@ -422,6 +425,90 @@ def check_suspended(symbols: list[str]) -> list[dict]:
     return out
 
 
+def mask_url(url: str) -> str:
+    return envstore.mask_url(url)
+
+
+def send_test_card(url: str) -> tuple[bool, str]:
+    """直接往指定 Webhook 发一张测试卡片。
+
+    不走 ``FeishuNotifier``——那个只能发「选股结果卡片」，而且只认 Settings 里
+    已保存的地址。这里自己拼一张卡片，好处是**可以测试还没保存的地址**，
+    用户改完 Webhook 能先点一下验证再存。
+    """
+    import requests
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "green",
+                "title": {"tag": "plain_text", "content": "Sequoia-X 工作台 · 连接测试"},
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**Webhook 配置成功** ✅\n\n发送时间：{now_str()}",
+                    },
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "note",
+                    "elements": [{
+                        "tag": "plain_text",
+                        "content": "看到这条消息说明这个 Webhook 能正常接收推送。",
+                    }],
+                },
+            ],
+        },
+    }
+    try:
+        resp = requests.post(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=12,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return False, f"HTTP {resp.status_code}，返回不是 JSON：{resp.text[:200]}"
+
+    if resp.status_code == 200 and data.get("code") == 0:
+        return True, "ok"
+    return False, f"HTTP {resp.status_code}，飞书返回：{data}"
+
+
+TASK_NAMES = ("Sequoia-X收盘后回填", "Sequoia-X每日选股")
+
+
+def task_action(name: str, action: str) -> tuple[bool, str]:
+    """启用 / 禁用 / 立即运行一个计划任务。返回 ``(是否成功, 提示文字)``。"""
+    import subprocess
+
+    args = {
+        "enable": ["schtasks", "/change", "/tn", name, "/enable"],
+        "disable": ["schtasks", "/change", "/tn", name, "/disable"],
+        "run": ["schtasks", "/run", "/tn", name],
+    }[action]
+    label = {"enable": "启用", "disable": "禁用", "run": "立即运行"}[action]
+    try:
+        proc = subprocess.run(args, capture_output=True, timeout=40)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+    text = _decode_output((proc.stdout or b"") + (proc.stderr or b"")).strip()
+    if proc.returncode == 0:
+        return True, f"已{label}「{name}」"
+    return False, f"{label}失败（退出码 {proc.returncode}）：{text[:300]}"
+
+
 def list_tasks() -> list[dict]:
     """通过 schtasks 读计划任务状态（只读，不修改）。
 
@@ -467,6 +554,10 @@ def list_tasks() -> list[dict]:
             info["state"] = f"读取失败：{exc}"
 
         info["last_result_text"] = _result_text(info["last_result"])[0]
+        # schtasks 对「从未运行过的任务」会给一个 1999-11-30 的占位日期，
+        # 直接显示成「上次运行 1999/11/30」会让人以为穿越了
+        if info["last_run"] and info["last_run"].startswith("1999"):
+            info["last_run"] = "从未运行"
         out.append(info)
 
     _tasks_cache, _tasks_at = out, time.time()
@@ -532,9 +623,10 @@ MAX_LOG_LINES = 2000
 
 
 class Job:
-    def __init__(self, job_id: str, kind: str):
+    def __init__(self, job_id: str, kind: str, params: dict | None = None):
         self.id = job_id
         self.kind = kind
+        self.params = dict(params or {})
         self.status = "running"
         self.started = now_str()
         self.ended: str | None = None
@@ -556,6 +648,7 @@ class Job:
         return {
             "id": self.id,
             "kind": self.kind,
+            "params": dict(self.params),
             "status": self.status,
             "started": self.started,
             "ended": self.ended,
@@ -616,7 +709,7 @@ class JobManager:
             return
         for rec in payload.get("jobs", []):
             try:
-                job = Job(rec["id"], rec.get("kind", "?"))
+                job = Job(rec["id"], rec.get("kind", "?"), rec.get("params"))
                 job.status = rec.get("status", "done")
                 job.started = rec.get("started", "")
                 job.ended = rec.get("ended")
@@ -666,11 +759,11 @@ class JobManager:
         with self._lock:
             return self._running
 
-    def start(self, kind: str) -> Job:
+    def start(self, kind: str, params: dict | None = None) -> Job:
         with self._lock:
             self._counter += 1
             job_id = f"j{self._counter}-{int(time.time())}"
-            job = Job(job_id, kind)
+            job = Job(job_id, kind, params)
             self._jobs[job_id] = job
             self._order.append(job_id)
             self._running = job_id
@@ -684,6 +777,8 @@ class JobManager:
         for lg in loggers:
             lg.addHandler(handler)
         job.add_log(f"===== 任务开始 {job.started}  类型={kind} =====")
+        if job.params:
+            job.add_log(f"参数：{json.dumps(job.params, ensure_ascii=False)}")
 
         def on_strategy(index: int, total: int, name: str) -> None:
             job.progress = {"done": index, "total": total, "text": f"执行策略 {index}/{total}：{name}"}
@@ -693,8 +788,12 @@ class JobManager:
                 self._job_signals(job, on_strategy)
             elif kind == "daily":
                 self._job_daily(job, on_strategy)
+            elif kind == "sync":
+                self._job_sync(job)
             elif kind == "backfill":
                 self._job_backfill(job)
+            elif kind == "reload":
+                self._job_reload(job)
             else:
                 raise ValueError(f"未知任务类型：{kind}")
             job.status = "done"
@@ -717,7 +816,37 @@ class JobManager:
                 self._running = None
             self._save()
 
-    # ── 三种任务 ──
+    # ── 各种任务 ──
+
+    def _resolve_symbols(self, job: Job, require: bool = False) -> list[str]:
+        """从 job.params 取要处理的股票；没指定就用全市场。
+
+        ``require=True`` 时（整只重拉）没指定就直接报错——绝对不能因为用户忘了填
+        就默默把全市场 5000 多只全部删掉重拉。
+        """
+        raw = job.params.get("symbols") or []
+        if isinstance(raw, str):
+            raw = re.split(r"[,\s;，、]+", raw)
+        symbols = []
+        for item in raw:
+            code = str(item).strip()
+            if not code:
+                continue
+            code = code.zfill(6)
+            if not re.fullmatch(r"\d{6}", code):
+                raise ValueError(f"股票代码格式不对：{item}（应为 6 位数字）")
+            symbols.append(code)
+        # 去重但保持顺序
+        symbols = list(dict.fromkeys(symbols))
+
+        if symbols:
+            log.info(f"按指定股票处理：{len(symbols)} 只")
+            return symbols
+        if require:
+            raise ValueError("必须指定股票代码（多个用逗号或空格分隔，例如 600519,000001）")
+        all_symbols = get_engine().get_all_symbols()
+        log.info(f"未指定股票，使用全市场 {len(all_symbols)} 只")
+        return all_symbols
 
     def _job_signals(self, job: Job, on_strategy) -> None:
         engine = get_engine()
@@ -755,13 +884,52 @@ class JobManager:
         job.progress = {"done": 0, "total": 7, "text": "执行 7 个策略并推送飞书…"}
         run_strategies(engine, settings, push=True, on_strategy=on_strategy)
 
-    def _job_backfill(self, job: Job) -> None:
+    def _job_sync(self, job: Job) -> None:
+        """只回填当日最新数据（增量，最快）。"""
         engine = get_engine()
-        job.progress = {"done": 0, "total": 0, "text": "获取全市场代码表…"}
-        symbols = engine.get_all_symbols()
-        job.add_log(f"全市场 {len(symbols)} 只，开始回填…")
-        job.progress = {"done": 0, "total": len(symbols), "text": f"回填 {len(symbols)} 只…"}
-        engine.backfill(symbols)
+        job.progress = {"done": 0, "total": 0, "text": "回填当日最新数据…"}
+        added = engine.sync_today_bulk()
+        job.add_log(f"当日增量完成，新增 {added} 行")
+        get_coverage(force=True)
+
+    def _job_backfill(self, job: Job) -> None:
+        """补齐缺口；带 start/end 时改为「覆盖指定日期区间」。"""
+        engine = get_engine()
+        start = str(job.params.get("start") or "").strip()
+        end = str(job.params.get("end") or "").strip()
+
+        if start or end:
+            if not (start and end):
+                raise ValueError("「指定日期区间」必须同时填开始和结束日期")
+            for label, value in (("开始日期", start), ("结束日期", end)):
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    raise ValueError(f"{label}格式必须是 YYYY-MM-DD")
+            if start > end:
+                raise ValueError("开始日期不能晚于结束日期")
+
+            job.progress = {"done": 0, "total": 0, "text": "获取股票列表…"}
+            symbols = self._resolve_symbols(job)
+            job.progress = {"done": 0, "total": len(symbols),
+                            "text": f"覆盖 {start} ~ {end}，共 {len(symbols)} 只…"}
+            result = engine.fill_range(symbols, start, end)
+            job.add_log(
+                f"区间覆盖完成：成功 {result['ok']} 失败 {result['failed']} "
+                f"跳过 {result['skipped']}（原数据源不可用，不换源补）"
+            )
+        else:
+            job.progress = {"done": 0, "total": 0, "text": "获取股票列表…"}
+            symbols = self._resolve_symbols(job)
+            job.progress = {"done": 0, "total": len(symbols), "text": f"补齐 {len(symbols)} 只…"}
+            engine.backfill(symbols)
+        get_coverage(force=True)
+
+    def _job_reload(self, job: Job) -> None:
+        """整只重拉：先删后拉，用来修「某只股票数据不对」。"""
+        engine = get_engine()
+        symbols = self._resolve_symbols(job, require=True)
+        job.progress = {"done": 0, "total": len(symbols), "text": f"整只重拉 {len(symbols)} 只…"}
+        result = engine.force_reload(symbols)
+        job.add_log(f"整只重拉完成：成功 {result['ok']} 失败 {result['failed']}")
         get_coverage(force=True)
 
 
@@ -848,6 +1016,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_logfile(path[len("/api/logs/"):], q)
             if path == "/api/tasks":
                 return self._json({"ok": True, "tasks": list_tasks()})
+            if path == "/api/settings":
+                return self._api_settings_get()
+            if path == "/api/db/backups":
+                return self._api_db_backups()
             if path == "/api/suspended-check":
                 return self._api_suspended_check()
 
@@ -876,6 +1048,18 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/jobs":
                 return self._api_start_job(body)
+            if parsed.path == "/api/settings":
+                return self._api_settings_save(body)
+            if parsed.path == "/api/settings/test-feishu":
+                return self._api_test_feishu(body)
+            if parsed.path == "/api/settings/probe-sources":
+                return self._api_probe_sources()
+            if parsed.path == "/api/tasks/action":
+                return self._api_task_action(body)
+            if parsed.path == "/api/db/backup":
+                return self._api_db_backup()
+            if parsed.path == "/api/cache/clear":
+                return self._api_cache_clear(body)
 
             return self._error(f"未知接口：{parsed.path}", 404)
         except Exception as exc:  # noqa: BLE001
@@ -1082,14 +1266,264 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_start_job(self, body: dict) -> None:
         kind = str(body.get("kind") or "").strip()
-        if kind not in ("daily", "backfill", "signals"):
+        if kind not in ("daily", "backfill", "signals", "sync", "reload"):
             return self._error(f"未知任务类型：{kind}")
+
+        params: dict = {}
+        if kind in ("backfill", "reload"):
+            raw_symbols = body.get("symbols")
+            if isinstance(raw_symbols, list):
+                params["symbols"] = [str(s).strip() for s in raw_symbols if str(s).strip()]
+            elif isinstance(raw_symbols, str) and raw_symbols.strip():
+                params["symbols"] = [s for s in re.split(r"[,\s;，、]+", raw_symbols) if s]
+            if kind == "reload" and not params.get("symbols"):
+                return self._error("整只重拉必须指定股票代码")
+            if kind == "backfill":
+                start = str(body.get("start") or "").strip()
+                end = str(body.get("end") or "").strip()
+                if start or end:
+                    if not (start and end):
+                        return self._error("指定日期区间时必须同时填开始和结束日期")
+                    for label, value in (("开始日期", start), ("结束日期", end)):
+                        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                            return self._error(f"{label}格式必须是 YYYY-MM-DD")
+                    if start > end:
+                        return self._error("开始日期不能晚于结束日期")
+                    params["start"], params["end"] = start, end
+
         busy = JOBS.is_busy()
         if busy:
             return self._error("已有任务在运行，请等它结束（同时只允许一个任务，避免争抢数据库）", 409)
-        job = JOBS.start(kind)
-        log.info(f"启动任务 {job.id} 类型={kind}")
+        job = JOBS.start(kind, params)
+        log.info(f"启动任务 {job.id} 类型={kind} 参数={params}")
         self._json({"ok": True, "job": job.snapshot(log_lines=0)})
+
+    # ── 设置 ──
+
+    def _settings_config(self) -> dict:
+        try:
+            s = get_settings()
+            return {
+                "data_source": s.data_source,
+                "auto_source_order": getattr(s, "auto_source_order", ""),
+                "db_path": s.db_path,
+                "ak_workers": s.ak_workers,
+                "ak_delay": s.ak_delay,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _api_settings_get(self) -> None:
+        self._json({
+            "ok": True,
+            "env_path": str(envstore.ENV_PATH),
+            "groups": envstore.build_groups(),
+            "config": self._settings_config(),
+        })
+
+    def _reload_settings(self) -> tuple[bool, str | None]:
+        """改完 .env 之后让新配置在当前进程里生效。
+
+        必须做的三件事：重置 Settings 单例（它是进程级缓存）、丢掉缓存的
+        DataEngine（它把当时的 settings 存在自己身上）、清掉依赖配置的数据缓存。
+        """
+        global _engine, _coverage_cache, _coverage_at
+        global _dbstats_cache, _dbstats_at, _tasks_cache, _tasks_at
+
+        try:
+            reset_settings()
+            get_settings()          # 立刻验证新配置能加载（比如必填项没丢）
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+
+        with _engine_lock:
+            _engine = None
+        with _coverage_lock:
+            _coverage_cache, _coverage_at = None, 0.0
+        _dbstats_cache, _dbstats_at = None, 0.0
+        _tasks_cache, _tasks_at = None, 0.0
+        return True, None
+
+    def _api_settings_save(self, body: dict) -> None:
+        values = body.get("values")
+        if not isinstance(values, dict) or not values:
+            return self._error("没有收到要保存的配置项")
+        try:
+            normalized, warnings = envstore.validate(values)
+        except envstore.SettingError as exc:
+            return self._error(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return self._error(f"配置校验失败：{type(exc).__name__}: {exc}")
+
+        try:
+            applied = envstore.write_env(normalized)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("写入 .env 失败")
+            return self._error(f"写入配置文件失败（已尝试还原备份）：{exc}")
+
+        ok, err = self._reload_settings()
+        if not ok:
+            warnings.append(
+                f"配置已写入文件，但当前进程重新加载失败，需要重启工作台：{err}"
+            )
+        else:
+            log.info(f"配置已更新并生效：{applied}")
+
+        restart_required = any(envstore.needs_restart(k) for k in applied)
+        if restart_required:
+            warnings.append("有改动需要重启工作台才生效（见对应项的说明）")
+
+        self._json({
+            "ok": True,
+            "applied": applied,
+            "warnings": warnings,
+            "restart_required": restart_required,
+            "reloaded": ok,
+            "groups": envstore.build_groups(),
+            "config": self._settings_config(),
+        })
+
+    def _api_test_feishu(self, body: dict) -> None:
+        url = envstore.resolve_webhook(body)
+        if not url:
+            return self._error("没有可用的 Webhook 地址：请先填写「主 Webhook 地址」")
+        if not url.startswith(("http://", "https://")):
+            return self._error("Webhook 地址必须是以 http:// 或 https:// 开头的地址")
+        ok, message = send_test_card(url)
+        if ok:
+            self._json({
+                "ok": True,
+                "message": "测试卡片已发送，去飞书群里看一下",
+                "webhook": envstore.mask_url(url),
+            })
+        else:
+            self._error(f"推送失败：{message}")
+
+    def _api_probe_sources(self) -> None:
+        results = get_engine().probe_all_sources()
+        healthy = [r["source"] for r in results if r.get("ok")]
+        self._json({"ok": True, "results": results, "healthy": healthy})
+
+    # ── 计划任务控制 ──
+
+    def _api_task_action(self, body: dict) -> None:
+        global _tasks_cache, _tasks_at
+
+        name = str(body.get("name") or "").strip()
+        action = str(body.get("action") or "").strip()
+        if name not in TASK_NAMES:
+            return self._error(f"未知的计划任务：{name}")
+        if action not in ("enable", "disable", "run"):
+            return self._error(f"未知的操作：{action}")
+        if action == "run" and JOBS.is_busy():
+            return self._error(
+                "工作台里有任务正在跑，等它结束再「立即运行」"
+                "（两个进程同时写数据库会互相干扰）", 409
+            )
+
+        ok, message = task_action(name, action)
+        _tasks_cache, _tasks_at = None, 0.0   # 状态变了，缓存作废
+        if not ok:
+            return self._error(message)
+        self._json({"ok": True, "message": message, "tasks": list_tasks()})
+
+    # ── 数据库备份 / 缓存 ──
+
+    def _api_db_backup(self) -> None:
+        import sqlite3
+
+        settings = get_settings()
+        src = REPO / settings.db_path
+        if not src.exists():
+            return self._error(f"数据库文件不存在：{src}")
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        name = f"{src.stem}-{datetime.now():%Y%m%d-%H%M%S}.db"
+        dst = BACKUP_DIR / name
+        try:
+            # 用 SQLite 自己的在线备份接口，比直接拷文件安全：
+            # 有别的进程正在写时也能拿到一致的快照
+            src_conn = sqlite3.connect(str(src))
+            try:
+                dst_conn = sqlite3.connect(str(dst))
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("备份数据库失败")
+            return self._error(f"备份失败：{type(exc).__name__}: {exc}")
+
+        # 只留最近 5 个备份，免得越堆越多把磁盘占满
+        files = sorted(BACKUP_DIR.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[5:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        log.info(f"数据库已备份：{name}")
+        self._json({
+            "ok": True,
+            "file": name,
+            "path": str(dst.relative_to(REPO)),
+            "size_mb": round(dst.stat().st_size / 1048576, 1),
+            "kept": min(len(files), 5),
+        })
+
+    def _api_db_backups(self) -> None:
+        files = []
+        if BACKUP_DIR.is_dir():
+            for p in sorted(BACKUP_DIR.glob("*.db"),
+                            key=lambda x: x.stat().st_mtime, reverse=True)[:20]:
+                st = p.stat()
+                files.append({
+                    "name": p.name,
+                    "size_mb": round(st.st_size / 1048576, 1),
+                    "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "path": str(p.relative_to(REPO)),
+                })
+        self._json({"ok": True, "files": files})
+
+    def _api_cache_clear(self, body: dict) -> None:
+        global _signals, _coverage_cache, _coverage_at
+        global _name_map, _name_loaded_at, _dbstats_cache, _dbstats_at
+
+        targets = body.get("targets")
+        if not isinstance(targets, list) or not targets:
+            targets = ["signals", "jobs", "names", "coverage"]
+        cleared: list[str] = []
+
+        if "signals" in targets:
+            with _signals_lock:
+                _signals = None
+            SIGNALS_CACHE.unlink(missing_ok=True)
+            cleared.append("signals")
+        if "jobs" in targets:
+            with JOBS._lock:
+                JOBS._jobs.clear()
+                JOBS._order.clear()
+            JOBS_FILE.unlink(missing_ok=True)
+            cleared.append("jobs")
+        if "names" in targets:
+            with _name_lock:
+                _name_map, _name_loaded_at = None, 0.0
+            NAME_CACHE.unlink(missing_ok=True)
+            cleared.append("names")
+        if "coverage" in targets:
+            with _coverage_lock:
+                _coverage_cache, _coverage_at = None, 0.0
+            _dbstats_cache, _dbstats_at = None, 0.0
+            cleared.append("coverage")
+
+        self._json({
+            "ok": True,
+            "cleared": cleared,
+            "message": f"已清理 {len(cleared)} 项缓存"
+            + ("（下次打开相关页面会重新计算）" if cleared else "（没有匹配的缓存项）"),
+        })
 
     def _api_logfiles(self) -> None:
         files = []
