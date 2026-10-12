@@ -68,7 +68,7 @@
 
 ```bash
 # 环境要求：Python >= 3.10
-git clone https://github.com/sngyai/Sequoia-X.git   # 或本仓库
+git clone <本仓库地址>          # 建议先 Fork 再 clone 自己的
 cd Sequoia-X
 
 # 1. 安装依赖（推荐 uv）

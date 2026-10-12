@@ -53,7 +53,7 @@ function Ok($m)   { Write-Host "  ✓ $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "  ⚠ $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host ""; Write-Host "✗ $m" -ForegroundColor Red; exit 1 }
 
-$RepoDir = Join-Path $Workspace "Sequoia-X"
+$RepoDir = $Workspace   # 脚本在 <仓库>\build 下，所以 Workspace 就是仓库本身
 if (-not (Test-Path $RepoDir)) { Die "找不到仓库目录：$RepoDir" }
 $Git = (Get-Command git -EA SilentlyContinue).Source
 if (-not $Git) { $Git = "$env:LOCALAPPDATA\Programs\sequoia-tools\mingit\cmd\git.exe" }
