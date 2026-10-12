@@ -20,24 +20,30 @@ ENV/
 # 注意不能只写 data/*.db：匹配不到 data/backups/ 下面的备份文件
 data/
 
-# .env 的备份与临时文件（Web 工作台改配置时产生）
+# 环境变量（.env 里有飞书 Webhook 和大模型 API Key，绝对不能提交）
+.env
 .env.bak
 .env.tmp
 
-# 环境变量
-.env
+# 打包产物（源码在 build/ 和 installer/ 里，那些要提交）
+build/out/
+installer/dist/
+installer/payload.zip
 
 # 打包构建
 *.egg-info/
 dist/
-build/
+build/lib/
+build/bdist*/
+build/scripts*/
 
 # 测试与工具缓存
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
 
 # 日志
 *.log
 
-# Hypothesis 测试缓存
-.hypothesis/
+# 由 verify-payload.ps1 生成（VERIFY-REPORT.md 是手写的，要提交）
+installer/verify-report.txt
