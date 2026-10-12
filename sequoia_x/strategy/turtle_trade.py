@@ -24,11 +24,15 @@ class TurtleTradeStrategy(BaseStrategy):
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
+        """查询候选股票的流通市值。
 
-        流通股本 = 成交量 / (换手率% / 100)
-        流通市值 = 流通股本 × 不复权收盘价
+        数据源跟随 ``engine.data_source``：
+        - akshare：直接取东方财富全市场快照的「流通市值」列（一次调用）
+        - baostock：流通股本 = 成交量 / (换手率% / 100)，流通市值 = 流通股本 × 不复权收盘价
         """
+        if getattr(self.engine, "data_source", "baostock") == "akshare":
+            return self._get_market_caps_akshare(symbols)
+
         from datetime import date
 
         import baostock as bs
@@ -63,6 +67,27 @@ class TurtleTradeStrategy(BaseStrategy):
             bs.logout()
 
         return market_caps
+
+    def _get_market_caps_akshare(self, symbols: list[str]) -> dict[str, float]:
+        """从东方财富全市场快照直接读「流通市值」。"""
+        import akshare as ak
+
+        from sequoia_x.data.engine import _ak_retry
+
+        spot = _ak_retry(lambda: ak.stock_zh_a_spot_em(), "全市场快照（市值）", retries=3)
+        if spot is None or spot.empty or "流通市值" not in spot.columns:
+            logger.warning("akshare 快照获取失败，海龟策略将不做市值排序")
+            return {}
+
+        want = set(symbols)
+        caps: dict[str, float] = {}
+        for code, cap in zip(spot["代码"].astype(str).str.zfill(6), spot["流通市值"]):
+            if code in want:
+                try:
+                    caps[code] = float(cap)
+                except (TypeError, ValueError):
+                    continue
+        return caps
 
     def run(self) -> list[str]:
         """

@@ -6,6 +6,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
     start_date: str = "2024-01-01"
+
+    # 行情数据源：baostock（项目默认）或 akshare（东方财富）
+    # 两者后复权算法不同，同一张表里绝不能混用，切换时必须清库重拉。
+    data_source: str = "baostock"
+
+    # akshare 回填时的并发线程数。东方财富对高频请求会瞬时断连（表现为
+    # RemoteDisconnected / ProxyError），并发不宜高，4 是实测较稳的值。
+    ak_workers: int = 4
+
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
 
