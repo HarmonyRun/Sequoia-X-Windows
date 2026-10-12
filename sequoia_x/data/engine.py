@@ -742,16 +742,18 @@ class DataEngine:
         return []
 
     def _plan_symbol(self, symbol, target_end, active, healthy, candidates):
-        """决定某只股票「用哪个源、从哪天开始拉」。
+        """决定某只股票「用哪些源、从哪天开始拉」。
 
-        返回 (symbol, start, source, rebase)；不需要处理则返回 None。
+        返回 (symbol, start, sources, rebase)；不需要处理则返回 None。
+        ``sources`` 是**候选源列表，按顺序试**——某个源对这只股票恰好没有数据
+        （实测 689009 在新浪拿不到、腾讯能拿到），就自动换下一个源。
 
         关键规则——**同一只股票绝不跨源拼接**：
-        - 库里没有任何数据：用当前活跃源，随便哪个都行
+        - 库里没有任何数据：所有可用源都可以试（跨股票用不同源是安全的）
         - 已有数据且记录了源：只认这个源（除非它长期不可用，见下）
         - 已有数据但没记录源（老库迁移）：按主源处理
         - 记录的源不可用，且已经陈旧到 rebase_stale_days 个交易日：
-          换源「整只重拉」（先删后拉，保证同股票内部自洽）
+          换源「整只重拉」（先删后拉，保证同股票内部自洽），同样可以按顺序试
         """
         from datetime import date, timedelta
 
@@ -768,40 +770,72 @@ class DataEngine:
             src = candidates[0]  # 老数据没有来源记录，按主源处理
 
         if src is None:
-            return (symbol, start, active, False)  # 全新股票
+            return (symbol, start, list(healthy), False)  # 全新股票：哪个源都行
         if src in healthy:
-            return (symbol, start, src, False)     # 沿用原源
+            return (symbol, start, [src], False)          # 沿用原源
         if last is not None and self._stale_trading_days(last, target_end) >= self.rebase_stale_days:
-            logger.debug(f"[{symbol}] 原数据源 {src} 不可用且已陈旧，换源 {active} 整只重拉")
-            return (symbol, self.start_date, active, True)
+            logger.debug(f"[{symbol}] 原数据源 {src} 不可用且已陈旧，换源整只重拉")
+            return (symbol, self.start_date, list(healthy), True)
         return None
 
-    def _fetch_and_store(self, symbol, start, source, target_end, rebase=False) -> bool:
-        """按指定源拉一段并写入。成功（含「区间内无新数据」）返回 True。"""
-        rows = fetch_from_source(source, symbol, start, target_end, 4, self.ak_delay)
-        if rows is None:
-            return False
-        if not rows.empty:
+    def _store(self, symbol, rows, source: str, rebase: bool = False) -> None:
+        """把某只股票的数据和它的来源写在同一个事务里。
+
+        顺序很重要：**先记来源，再写数据**。如果反过来（先写数据、后记来源），
+        进程在两步之间被杀就会留下「有数据但没有来源记录」的股票，下次增量会按
+        主源去拉，而这份数据其实来自另一个源 —— 同股跨源拼接，假跳空。
+
+        反过来先记来源则最多留下「有来源、没数据」，那只股票会被当成全新股票
+        重新拉取，不会污染任何已有数据。
+        """
+        from datetime import datetime
+
+        with _connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO symbol_source (symbol, source, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(symbol) DO UPDATE SET source = excluded.source, "
+                "updated_at = excluded.updated_at",
+                (symbol, source, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
             if rebase:
-                self._delete_symbol(symbol)
+                conn.execute("DELETE FROM stock_daily WHERE symbol = ?", (symbol,))
+            if not rows.empty:
+                rows.to_sql(
+                    "stock_daily", conn, if_exists="append",
+                    index=False, method="multi", chunksize=500,
+                )
+            conn.commit()
+
+    def _fetch_and_store(self, symbol, start, sources, target_end, rebase=False) -> bool:
+        """按候选源顺序拉一段并写入，第一个成功的源就用它。
+
+        ``sources`` 是列表：某个源对这只股票恰好没有数据（返回 None）时自动换
+        下一个源。**只有「整只重拉」或「全新股票」才会给出多个候选源**——
+        已有数据的股票只给一个源，避免同股跨源拼接。
+        """
+        for source in sources:
+            rows = fetch_from_source(source, symbol, start, target_end, 4, self.ak_delay)
+            if rows is None:
+                logger.debug(f"[{symbol}] 数据源 {source} 请求失败，尝试下一个源")
+                continue
             try:
-                self._write_rows(rows)
+                self._store(symbol, rows, source, rebase)
             except sqlite3.IntegrityError:
                 pass  # 已存在，算成功
-        self._set_symbol_source(symbol, source)
-        return True
+            return True
+        return False
 
     def _process_batch(self, todo: list) -> tuple[int, int]:
-        """并发处理一批 (symbol, start, source, rebase)，返回 (成功, 失败)。"""
+        """并发处理一批 (symbol, start, sources, rebase, target_end)，返回 (成功, 失败)。"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         ok = failed = done = 0
         with ThreadPoolExecutor(max_workers=self.ak_workers) as pool:
             futures = {
                 pool.submit(
-                    self._fetch_and_store, symbol, start, source, target_end, rebase
+                    self._fetch_and_store, symbol, start, sources, target_end, rebase
                 ): symbol
-                for symbol, start, source, rebase, target_end in todo
+                for symbol, start, sources, rebase, target_end in todo
             }
             for fut in as_completed(futures):
                 symbol = futures[fut]
