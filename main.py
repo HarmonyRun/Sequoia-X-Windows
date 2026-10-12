@@ -18,23 +18,13 @@ import sys
 from dotenv import load_dotenv
 load_dotenv()
 
-from datetime import date
-
 import socket
 socket.setdefaulttimeout(10.0)
 
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
-from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
-from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+from sequoia_x.pipeline import run_strategies
 
 
 def main() -> None:
@@ -58,47 +48,20 @@ def main() -> None:
         engine = DataEngine(settings)
 
         if args.backfill:
-            # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
+            # ── 回填模式：补齐全市场缺失的历史/最新 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
             all_symbols = engine.get_all_symbols()
             engine.backfill(all_symbols)
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
+        # ── 日常模式：增量补最新交易日 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+        logger.info(f"增量同步完成，新增 {count} 行")
 
-        # 4. 策略列表（新增策略在此追加即可）
-        strategies: list[BaseStrategy] = [
-            MaVolumeStrategy(engine=engine, settings=settings),
-            TurtleTradeStrategy(engine=engine, settings=settings),
-            HighTightFlagStrategy(engine=engine, settings=settings),
-            LimitUpShakeoutStrategy(engine=engine, settings=settings),
-            UptrendLimitDownStrategy(engine=engine, settings=settings),
-            RpsBreakoutStrategy(engine=engine, settings=settings),
-            PrivatePlacementStrategy(engine=engine, settings=settings),
-        ]
-
-        notifier = FeishuNotifier(settings)
-
-        # 5. 遍历策略，有结果则推送至对应机器人
-        for strategy in strategies:
-            strategy_name = type(strategy).__name__
-            logger.info(f"执行策略：{strategy_name}")
-
-            selected: list[str] = strategy.run()
-            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
-
-            if selected:
-                notifier.send(
-                    symbols=selected,
-                    strategy_name=strategy_name,
-                    webhook_key=strategy.webhook_key,
-                )
-            else:
-                logger.info(f"{strategy_name} 无选股结果，跳过推送")
+        # 4/5. 策略列表与执行都在 sequoia_x.pipeline 里（命令行与 Web 工作台共用）
+        run_strategies(engine, settings, push=True)
 
     except Exception:
         try:

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sequoia-X 工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- =====================================================================
+     顶部固定 Header：标题 / 当前数据日期 / 股票数 / 刷新
+     ===================================================================== -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>Sequoia-X 工作台</h1>
+    <span class="brand-sub">A 股量化选股终端</span>
+  </div>
+  <div class="topbar-meta">
+    <span class="meta-item"><i>数据日期</i><b id="hd-date">--</b></span>
+    <span class="meta-item"><i>股票数</i><b id="hd-symbols">--</b></span>
+    <button id="btn-refresh" class="btn btn-primary" type="button">刷新</button>
+  </div>
+</header>
+
+<!-- =====================================================================
+     Tab 导航（URL hash 路由：#overview / #signals / #stock / #coverage / #jobs）
+     ===================================================================== -->
+<nav class="tabs" id="tabs">
+  <a class="tab" href="#overview" data-tab="overview">总览</a>
+  <a class="tab" href="#signals"  data-tab="signals">选股结果</a>
+  <a class="tab" href="#stock"    data-tab="stock">个股</a>
+  <a class="tab" href="#coverage" data-tab="coverage">数据覆盖</a>
+  <a class="tab" href="#jobs"     data-tab="jobs">运行与日志</a>
+</nav>
+
+<!-- 全局错误条 / 轻提示 -->
+<div id="error-bar" class="error-bar" hidden></div>
+<div id="toast" class="toast" hidden></div>
+
+<main class="main">
+
+  <!-- ===================================================================
+       Tab 1 —— 总览
+       =================================================================== -->
+  <section id="view-overview" class="view" data-view="overview">
+    <!-- 统计卡片 -->
+    <div class="stat-grid" id="ov-stats"></div>
+
+    <div class="grid-2">
+      <!-- 数据源分布（SVG 环形图 + 图例） -->
+      <div class="card">
+        <div class="card-head">
+          <h2>数据源分布</h2>
+          <span class="hint">sources</span>
+        </div>
+        <div class="card-body" id="ov-sources"></div>
+      </div>
+
+      <!-- 各股票最新数据日期分布（SVG 横向柱状图） -->
+      <div class="card">
+        <div class="card-head">
+          <h2>最新数据日期分布</h2>
+          <span class="hint">last_dates</span>
+        </div>
+        <div class="card-body" id="ov-lastdates"></div>
+      </div>
+    </div>
+
+    <!-- 板块分布（SVG 横向柱状图） -->
+    <div class="card">
+      <div class="card-head">
+        <h2>板块分布</h2>
+        <span class="hint">boards</span>
+      </div>
+      <div class="card-body" id="ov-boards"></div>
+    </div>
+
+    <div class="grid-2">
+      <!-- 计划任务 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>计划任务</h2>
+          <span class="hint">tasks</span>
+        </div>
+        <div class="card-body" id="ov-tasks"></div>
+      </div>
+
+      <!-- 当前配置 -->
+      <div class="card">
+        <div class="card-head">
+          <h2>当前配置</h2>
+          <span class="hint">config</span>
+        </div>
+        <div class="card-body" id="ov-config"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================
+       Tab 2 —— 选股结果
+       =================================================================== -->
+  <section id="view-signals" class="view" data-view="signals" hidden>
+    <div class="card">
+      <div class="card-head">
+        <h2>选股信号</h2>
+        <div class="head-actions">
+          <span class="meta" id="sig-meta">加载中…</span>
+          <button id="btn-recalc" class="btn btn-primary" type="button">重新计算信号</button>
+        </div>
+      </div>
+    </div>
+    <!-- 按策略分组的卡片列表（JS 渲染） -->
+    <div id="sig-groups"></div>
+  </section>
+
+  <!-- ===================================================================
+       Tab 3 —— 个股
+       =================================================================== -->
+  <section id="view-stock" class="view" data-view="stock" hidden>
+    <div class="card">
+      <div class="card-body search-row">
+        <div class="search-wrap">
+          <input id="stock-q" class="input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="输入代码或名称，回车搜索（如 600519 / 贵州茅台）">
+          <div id="stock-suggest" class="suggest" hidden></div>
+        </div>
+        <div class="seg" id="stock-range">
+          <button type="button" data-days="60">60 日</button>
+          <button type="button" data-days="120">120 日</button>
+          <button type="button" data-days="250" class="active">250 日</button>
+        </div>
+      </div>
+    </div>
+    <!-- 个股详情（JS 渲染） -->
+    <div id="stock-detail">
+      <div class="empty">请在上方搜索并选择一只股票，或从「选股结果」中点击股票代码加载。</div>
+    </div>
+  </section>
+
+  <!-- ===================================================================
+       Tab 4 —— 数据覆盖
+       =================================================================== -->
+  <section id="view-coverage" class="view" data-view="coverage" hidden>
+    <div class="card">
+      <div class="card-head">
+        <h2>数据覆盖</h2>
+        <div class="head-actions">
+          <div class="seg" id="cov-filter">
+            <button type="button" data-filter="all" class="active">全部</button>
+            <button type="button" data-filter="stale">数据落后</button>
+            <button type="button" data-filter="suspended">停牌或缺失</button>
+          </div>
+          <input id="cov-q" class="input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="搜索代码或名称">
+          <button type="button" class="btn" id="cov-check">核查停牌</button>
+          <span class="meta" id="cov-total">--</span>
+        </div>
+      </div>
+      <div class="card-body" id="cov-check-result" hidden></div>
+      <div class="card-body" id="cov-table"></div>
+    </div>
+  </section>
+
+  <!-- ===================================================================
+       Tab 5 —— 运行与日志
+       =================================================================== -->
+  <section id="view-jobs" class="view" data-view="jobs" hidden>
+    <!-- 三个操作卡片 -->
+    <div class="action-grid">
+      <button class="action-card" type="button" data-kind="daily">
+        <span class="action-title">运行日常选股</span>
+        <span class="action-desc">完整跑一遍数据更新 + 全部策略，并把结果推送到飞书。</span>
+        <span class="action-kind">kind = daily</span>
+      </button>
+      <button class="action-card" type="button" data-kind="signals">
+        <span class="action-title">只计算信号</span>
+        <span class="action-desc">基于当前数据库重算全部策略信号，不发送任何推送。</span>
+        <span class="action-kind">kind = signals</span>
+      </button>
+      <button class="action-card" type="button" data-kind="backfill">
+        <span class="action-title">回填全市场最新数据</span>
+        <span class="action-desc">对落后或缺失的股票补齐最新日线数据。</span>
+        <span class="action-kind">kind = backfill</span>
+      </button>
+    </div>
+
+    <!-- 正在运行的任务（含实时日志窗口） -->
+    <div class="card">
+      <div class="card-head">
+        <h2>正在运行的任务</h2>
+        <span class="hint" id="jobs-running-hint"></span>
+      </div>
+      <div class="card-body" id="jobs-running"></div>
+    </div>
+
+    <!-- 历史任务 -->
+    <div class="card">
+      <div class="card-head">
+        <h2>历史任务</h2>
+        <div class="head-actions">
+          <button id="btn-jobs-refresh" class="btn" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="card-body" id="jobs-history"></div>
+    </div>
+
+    <!-- 日志文件 -->
+    <div class="card">
+      <div class="card-head">
+        <h2>日志文件</h2>
+        <div class="head-actions">
+          <button id="btn-logs-refresh" class="btn" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="card-body" id="logs-panel"></div>
+    </div>
+  </section>
+
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
