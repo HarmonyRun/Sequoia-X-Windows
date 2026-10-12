@@ -220,6 +220,23 @@ if ($target) {
 
 $pushUrl = "https://github.com/$Owner/$RepoName.git"
 Say "推送目标：$pushUrl"
+
+# 本机直连 github.com:443 **很不稳定**（实测经常 "Could not connect to server" /
+# "Empty reply from server"，而 api.github.com 却一直是通的）。
+# 注意：ghproxy 那条 insteadOf 规则对 push 帮不上忙——它只是把地址换个域名，
+# 而 push 必须打到真正的 github.com（否则 token 就给了第三方）。
+# 所以这里探一下本地代理，有就走它。
+$proxy = ""
+try {
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    $tcp.Connect("127.0.0.1", 7890)
+    $tcp.Close()
+    $proxy = "http://127.0.0.1:7890"
+    Say "检测到本地代理 127.0.0.1:7890，push 会走它（直连 github.com 很不稳）"
+} catch {
+    Say "没有可用本地代理，直连 github.com"
+}
+
 if ($DryRun) { Say "（DryRun：不推送）" }
 else {
     # askpass：git 问用户名时给固定值，问密码时给 token。
@@ -237,7 +254,9 @@ if %errorlevel%==0 (echo x-access-token) else (echo %GITHUB_TOKEN%)
         # -c credential.helper=  清掉全局的 credential manager（本机没装 GCM，留着会失败）
         # 默认**不加 --force**：万一你之后在 GitHub 上直接改过 main，
         # 强推会把那些提交冲掉。确实要覆盖再显式加 -Force。
-        $pushArgs = @("-C", $RepoDir, "-c", "credential.helper=", "push")
+        $pushArgs = @("-C", $RepoDir, "-c", "credential.helper=")
+        if ($proxy) { $pushArgs += @("-c", "http.proxy=$proxy", "-c", "https.proxy=$proxy") }
+        $pushArgs += "push"
         if ($Force) { $pushArgs += "--force" }
         $pushArgs += @($pushUrl, "windows-compat:refs/heads/$Branch")
         & $Git @pushArgs
