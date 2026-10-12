@@ -509,6 +509,132 @@ def task_action(name: str, action: str) -> tuple[bool, str]:
     return False, f"{label}失败（退出码 {proc.returncode}）：{text[:300]}"
 
 
+# ── 定时任务：安装版首次启动时自动创建 ──
+#
+# 安装包分发给别人之后，那两个「每个交易日 16:00 回填 / 19:15 选股」的任务在
+# 新机器上是**不存在**的（本机这两个是我手工建的），所以安装版第一次启动时补建。
+#
+# 为什么用 XML 而不是 schtasks 的命令行参数：**只有 XML 能指定工作目录**。
+# 计划任务默认在 C:\Windows\System32 下启动，而应用要按相对路径找
+# data\sequoia_v2.db —— 用 /tr 建出来的任务一跑就会在新目录里建一个空库，
+# 用户会以为「数据没了」。
+_TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{desc}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>{start}</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <DaysOfWeek><Monday/><Tuesday/><Wednesday/><Thursday/><Friday/></DaysOfWeek>
+        <WeeksInterval>1</WeeksInterval>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{cwd}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _installed_layout() -> tuple[Path, Path] | None:
+    """判断当前是不是「安装版」布局，返回 ``(pythonw.exe, app目录)``。
+
+    安装版的布局是::
+
+        <安装目录>\\runtime\\pythonw.exe
+        <安装目录>\\app\\webui\\server.py    ← REPO = <安装目录>\\app
+
+    注意 ``runtime\\`` 在 REPO 的**上一级**（第一版写成 REPO/runtime 了，结果
+    安装版永远检测不到、定时任务建不出来）。REPO 本身就是 app 目录。
+
+    开发机上 ``<仓库>\\runtime\\pythonw.exe`` 不存在，返回 None —— 不会去动
+    开发机的计划任务。
+    """
+    pythonw = REPO.parent / "runtime" / "pythonw.exe"
+    if pythonw.is_file() and (REPO / "main.py").is_file() and (REPO / "webui").is_dir():
+        return pythonw, REPO
+    return None
+
+
+def ensure_scheduled_tasks() -> None:
+    """确保两个定时任务存在；已存在就跳过，失败只记日志不影响使用。"""
+    import subprocess
+    import tempfile
+    from datetime import date, timedelta
+
+    global _tasks_cache, _tasks_at
+
+    layout = _installed_layout()
+    if layout is None:
+        return
+    pythonw, app = layout
+
+    plans = [
+        ("Sequoia-X收盘后回填", "每个交易日收盘后一小时回填全市场最新行情数据",
+         "16:00", "PT3H", "main.py --backfill"),
+        ("Sequoia-X每日选股", "每个交易日 19:15 运行全部策略并推送飞书",
+         "19:15", "PT2H", "main.py"),
+    ]
+    # 起始时间设成明天，避免刚建出来就被判定为「错过了今天的触发」
+    tomorrow = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    created = []
+    for name, desc, hhmm, limit, arguments in plans:
+        try:
+            probe = subprocess.run(["schtasks", "/query", "/tn", name],
+                                   capture_output=True, timeout=20)
+            if probe.returncode == 0:
+                continue
+            xml = _TASK_XML.format(
+                desc=desc, start=f"{tomorrow}T{hhmm}:00", limit=limit,
+                command=str(pythonw), arguments=arguments, cwd=str(app),
+            )
+            tmp = Path(tempfile.gettempdir()) / f"seqx-task-{hhmm.replace(':', '')}.xml"
+            tmp.write_text(xml, encoding="utf-16")   # schtasks 要求 Unicode XML
+            try:
+                proc = subprocess.run(
+                    ["schtasks", "/create", "/tn", name, "/xml", str(tmp), "/f"],
+                    capture_output=True, timeout=30,
+                )
+            finally:
+                tmp.unlink(missing_ok=True)
+            if proc.returncode == 0:
+                log.info(f"已创建定时任务：{name}（每个交易日 {hhmm}）")
+                created.append(name)
+            else:
+                detail = _decode_output((proc.stdout or b"") + (proc.stderr or b"")).strip()
+                log.warning(f"创建定时任务 {name} 失败：{detail[:200]}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"创建定时任务 {name} 时出错（不影响使用）：{exc}")
+
+    if created:
+        _tasks_cache, _tasks_at = None, 0.0   # 让设置页立刻能看到新任务
+
+
 def list_tasks() -> list[dict]:
     """通过 schtasks 读计划任务状态（只读，不修改）。
 
@@ -1551,21 +1677,50 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "name": name, "lines": lines})
 
 
-def main() -> None:
-    STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    # 预热：引擎 + 名称表（首次请求就不用等）
+def _warmup() -> None:
+    """后台预热：引擎 + 股票名称表。
+
+    ⚠️ 必须放后台线程，不能挡在 serve_forever() 前面。实测教训：安装包分发的
+    机器上 `ak.stock_info_a_code_name()` 走的是东方财富的 82.push2 接口，如果它被
+    墙/被限流，要在那里卡好几分钟——期间端口根本没在监听，启动器会一直显示
+    「正在启动服务…」然后超时报失败，用户以为装坏了。
+    """
     try:
         get_engine()
-        get_name_map()
+        log.info("预热：数据引擎就绪")
     except Exception as exc:  # noqa: BLE001
-        log.warning(f"预热失败（不影响启动）：{exc}")
+        log.warning(f"预热数据引擎失败（不影响启动）：{exc}")
+    try:
+        names = get_name_map()
+        log.info(f"预热：股票名称表就绪（{len(names)} 条）")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"预热股票名称表失败（不影响启动，用到时再试）：{exc}")
 
+    # 安装版第一次启动时补建「每个交易日 16:00 回填 / 19:15 选股」两个定时任务。
+    # 开发机上没有 runtime\ 目录，这个函数会直接返回，不会动本机的计划任务。
+    try:
+        ensure_scheduled_tasks()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"检查定时任务失败（不影响使用）：{exc}")
+
+
+def main() -> None:
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 先起监听，预热丢后台——这样「装完双击就能打开页面」，不会因为某个
+    # 外部数据源慢而卡住启动
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     httpd.daemon_threads = True
+
+    threading.Thread(target=_warmup, daemon=True, name="seqx-warmup").start()
+
     log.info("=" * 62)
     log.info(f"  Sequoia-X Web 工作台已启动：http://{HOST}:{PORT}")
     log.info(f"  仓库目录：{REPO}")
-    log.info(f"  数据源：{get_settings().data_source}    仅本机可访问")
+    try:
+        log.info(f"  数据源：{get_settings().data_source}    仅本机可访问")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"  读取配置失败：{exc}")
     log.info("  按 Ctrl+C 停止")
     log.info("=" * 62)
     try:

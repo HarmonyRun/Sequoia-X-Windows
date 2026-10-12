@@ -17,19 +17,23 @@ class Settings(BaseSettings):
     # ⚠️ 不同源的后复权算法不同（同一只股票同一天的价格基准能差 40%），
     #    所以每只股票的数据源会被记录在 symbol_source 表里，增量更新只认这个源，
     #    绝不允许同一只股票一半用 A 源、一半用 B 源。
-    data_source: str = "baostock"
+    #
+    # 默认 auto 而不是 upstream 的 baostock：安装包分发给别人时要保证「装完就能用」，
+    # 而 baostock 需要登录、且会拉黑高频请求的 IP；auto 在某个源不可用时会自动换源。
+    data_source: str = "auto"
 
     # auto 模式下数据源的尝试顺序（逗号分隔）。
-    auto_source_order: str = "eastmoney,tencent,sina"
+    # 东方财富数据质量最好放第一，被限流时自动退到后面。新浪排在腾讯前面是因为
+    # 实测快 3 倍（0.56 秒/只 vs 1.85 秒/只）。
+    auto_source_order: str = "eastmoney,sina,tencent"
 
     # 回填并发线程数。东方财富对高频请求会瞬时断连（RemoteDisconnected /
-    # ProxyError），并发不宜高；连续拉几千只后还会升级为硬限流，2 是实测较稳的值。
-    ak_workers: int = 4
+    # ProxyError），并发不宜高；实测 4 线程无间隔连续拉 4000+ 只会升级为硬限流
+    # （失败率 13% → 79%），3 是实测较稳的值。
+    ak_workers: int = 3
 
-    # 每次请求前的间隔（秒）。连续拉几千只之后东方财富会升级为硬限流
-    # （实测失败率从 13% 一路涨到 79%，之后整段冷却期内 100% 失败），
-    # 补缺口时用 2 线程 + 0.3 秒会温和很多。
-    ak_delay: float = 0.0
+    # 每次请求前的间隔（秒）。配合并发数一起控制请求速率。
+    ak_delay: float = 0.3
 
     # 单只股票连续多少个交易日拿不到新数据后，允许换一个可用的数据源
     # 「整只重拉」。换源会改变该股票的历史价格基准，但同股票内部仍然自洽
@@ -38,7 +42,10 @@ class Settings(BaseSettings):
     # 2 = 更保守，等源挂满 2 个交易日才换。
     rebase_stale_days: int = 1
 
-    feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
+    # 飞书群机器人 Webhook。默认空字符串而不是必填：安装包分发给别人时要保证
+    # 「装完就能启动」，用户可以在 Web 工作台的「设置」页里填（那边会校验必填）。
+    # 没配之前策略照常跑，只是跳过推送。
+    feishu_webhook_url: str = ""
     strategy_webhooks: dict[str, str] = {}
 
     model_config = SettingsConfigDict(
@@ -83,7 +90,10 @@ class Settings(BaseSettings):
         for key, value in os.environ.items():
             if key.upper().startswith(prefix):
                 strategy_key = key[len(prefix):].lower()
-                webhooks[strategy_key] = value
+                # 空值不要记进来：否则 get_webhook_url 会返回空串，
+                # 而不是回退到主 Webhook
+                if value and value.strip():
+                    webhooks[strategy_key] = value.strip()
 
         # 使用 object.__setattr__ 绕过 pydantic 的不可变保护
         object.__setattr__(self, "strategy_webhooks", webhooks)
@@ -92,15 +102,18 @@ class Settings(BaseSettings):
         """
         根据 webhook_key 返回对应的 Webhook URL。
 
-        优先从 strategy_webhooks 查找，找不到则 fallback 到 feishu_webhook_url。
+        优先从 strategy_webhooks 查找，找不到**或为空**则 fallback 到
+        feishu_webhook_url（安装包分发的场景下 .env 里这些键会留空，
+        不能因此把推送整个丢掉）。
 
         Args:
             webhook_key: 策略标识，如 'ma_volume'、'breakout'。
 
         Returns:
-            对应的 Webhook URL 字符串。
+            对应的 Webhook URL 字符串；两者都没配时返回空串。
         """
-        return self.strategy_webhooks.get(webhook_key.lower(), self.feishu_webhook_url)
+        specific = (self.strategy_webhooks.get(webhook_key.lower()) or "").strip()
+        return specific or (self.feishu_webhook_url or "").strip()
 
 
 _settings: Settings | None = None

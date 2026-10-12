@@ -159,6 +159,15 @@ class FeishuNotifier:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
+        if not url:
+            # 安装包分发的场景下用户可能还没配 Webhook。这时不要报错刷屏，
+            # 提示一次就够了（选股结果照样算出来，只是不推送）。
+            logger.warning(
+                f"未配置飞书 Webhook，跳过推送 [{webhook_key}]。"
+                "请到 Web 工作台的「设置」页填写主 Webhook 地址。"
+            )
+            return
+
         payload = self._build_card(symbols, strategy_name)
 
         try:
