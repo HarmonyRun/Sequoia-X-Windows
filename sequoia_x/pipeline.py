@@ -13,6 +13,7 @@ from sequoia_x.data.engine import DataEngine
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.boll_breakout import BollBreakoutStrategy
+from sequoia_x.strategy.custom_rule import CustomRuleStrategy
 from sequoia_x.strategy.gap_up import GapUpStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
@@ -52,6 +53,10 @@ STRATEGY_CLASSES: list[type[BaseStrategy]] = [
     VolumePriceRiseStrategy,
     RsiOversoldReboundStrategy,
     GapUpStrategy,
+    # ── 用户自定义（自然语言生成的规则）──
+    # 排在最后：它一次跑完所有自定义规则，通常比其他策略慢，
+    # 放最后能让用户先看到内置策略的结果。
+    CustomRuleStrategy,
 ]
 
 # 中文短名，供 Web 工作台展示
@@ -73,6 +78,8 @@ STRATEGY_LABELS: dict[str, str] = {
     "vol_price": "量价齐升",
     "rsi_rebound": "RSI超卖反弹",
     "gap_up": "向上跳空缺口",
+    # 用户自定义
+    "custom": "自定义策略",
 }
 
 # 策略分组：供 Web 工作台把「原项目自带」和「本项目新增」分开展示，
@@ -86,7 +93,11 @@ STRATEGY_GROUPS: dict[str, list[str]] = {
         "ma_bullish", "macd_cross", "boll_breakout", "ma_cross",
         "ma_squeeze", "vol_price", "rsi_rebound", "gap_up",
     ],
+    "custom": ["custom"],
 }
+
+# 自定义策略的 webhook_key（只有一个，内部包含用户建的每条规则）
+CUSTOM_KEY = "custom"
 
 
 def enabled_keys(settings: Settings) -> set[str]:
@@ -129,7 +140,13 @@ def strategy_meta(settings: Settings | None = None) -> list[dict]:
             保持老调用点的行为不变。
     """
     keys = enabled_keys(settings) if settings is not None else None
-    added = set(STRATEGY_GROUPS.get("added", []))
+    # 反查分组：按 STRATEGY_GROUPS 正向查找，而不是「不在 added 就算 upstream」。
+    # 后者会把新增的 custom 组误判成 upstream（踩过）。
+    group_of: dict[str, str] = {}
+    for gname, members in STRATEGY_GROUPS.items():
+        for key in members:
+            group_of[key] = gname
+
     out = []
     for cls in STRATEGY_CLASSES:
         doc = (cls.__doc__ or "").strip().splitlines()
@@ -140,8 +157,8 @@ def strategy_meta(settings: Settings | None = None) -> list[dict]:
                 "label": STRATEGY_LABELS.get(cls.webhook_key, cls.webhook_key),
                 "desc": doc[0].strip() if doc else "",
                 "enabled": True if keys is None else (cls.webhook_key in keys),
-                # 前端据此分组显示「原项目自带 / 本项目新增」
-                "group": "added" if cls.webhook_key in added else "upstream",
+                # 前端据此分组显示「原项目自带 / 本项目新增 / 自定义」
+                "group": group_of.get(cls.webhook_key, "added"),
             }
         )
     return out
@@ -198,6 +215,23 @@ def run_strategies(
         # 注意：每个策略内部已经打过「选出 N 只股票」，这里不再重复打一遍
         entry["symbols"] = selected
         results.append(entry)
+
+        # 自定义策略特殊处理：它一次跑完所有规则，推送时要**按规则分开推**，
+        # 否则用户建了 5 条规则会收到一张混在一起的卡片，不知道哪只票是哪条规则选的。
+        per_rule = getattr(strategy, "last_results", None)
+        if strategy.webhook_key == CUSTOM_KEY and per_rule is not None:
+            entry["per_rule"] = {k: list(v) for k, v in per_rule.items()}
+            if push:
+                for rule_name, codes in per_rule.items():
+                    if codes:
+                        notifier.send(
+                            symbols=codes,
+                            strategy_name=f"自定义 · {rule_name}",
+                            webhook_key=CUSTOM_KEY,
+                        )
+                    else:
+                        logger.info(f"自定义策略「{rule_name}」无选股结果，跳过推送")
+            continue
 
         if selected:
             if push:
