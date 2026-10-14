@@ -41,8 +41,20 @@ load_dotenv(REPO / ".env")
 
 from sequoia_x.core.config import get_settings, reset_settings  # noqa: E402
 from sequoia_x.data.engine import DataEngine  # noqa: E402
-from sequoia_x.pipeline import run_daily, run_strategies, strategy_meta  # noqa: E402
+from sequoia_x.pipeline import (  # noqa: E402
+    STRATEGY_GROUPS,
+    run_daily,
+    run_strategies,
+    strategy_meta,
+)
 from webui import envstore  # noqa: E402
+
+# 策略分组的显示标题。分组的**成员和顺序**来自 pipeline.STRATEGY_GROUPS
+# （单一来源，不在别处复制），这里只补中文标题。
+GROUP_TITLES: dict[str, str] = {
+    "upstream": "原项目自带",
+    "added": "本项目新增",
+}
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DATA_DIR = REPO / "data"
@@ -1136,7 +1148,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/coverage":
                 return self._api_coverage(q)
             if path == "/api/strategies":
-                return self._json({"ok": True, "strategies": strategy_meta()})
+                return self._api_strategies_get()
             if path == "/api/signals":
                 return self._api_signals()
             if path == "/api/search":
@@ -1452,6 +1464,59 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             return {"error": f"{type(exc).__name__}: {exc}"}
 
+    def _api_strategies_get(self) -> None:
+        """策略清单 + 启用状态，供设置页渲染勾选面板。
+
+        必须传 ``settings``：``strategy_meta()`` 不传参时 ``enabled`` 一律为
+        True，前端会把所有策略都画成勾选状态，与 .env 里的实际配置不符。
+
+        ``get_settings()`` 每次都重新取：保存设置后服务端会调 ``reset_settings()``
+        清掉单例，这里跟着拿到最新值，不需要额外缓存。
+        """
+        try:
+            settings = get_settings()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("读取配置失败")
+            return self._error(f"读取配置失败：{type(exc).__name__}: {exc}", 500)
+
+        try:
+            meta = strategy_meta(settings)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("读取策略清单失败")
+            return self._error(f"读取策略清单失败：{type(exc).__name__}: {exc}", 500)
+
+        # 分组顺序与组内顺序都以 pipeline.STRATEGY_GROUPS 为准（单一来源），
+        # 这里只负责把 strategy_meta 的扁平结果按 group 字段装进桶里。
+        order = list(STRATEGY_GROUPS.keys())
+        buckets: dict[str, list[dict]] = {g: [] for g in order}
+        for item in meta:
+            group = item.get("group") or (order[0] if order else "upstream")
+            buckets.setdefault(group, []).append({
+                "key": item["key"],
+                "name": item.get("name", ""),
+                "label": item.get("label", item["key"]),
+                "desc": item.get("desc", ""),
+                "enabled": bool(item.get("enabled", True)),
+            })
+
+        groups = [
+            {"key": g, "title": GROUP_TITLES.get(g, g), "items": buckets.get(g, [])}
+            for g in order
+        ] + [
+            {"key": g, "title": GROUP_TITLES.get(g, g), "items": items}
+            for g, items in buckets.items() if g not in order and items
+        ]
+
+        enabled_count = sum(1 for it in meta if it.get("enabled", True))
+        self._json({
+            "ok": True,
+            "total": len(meta),
+            "enabled": enabled_count,
+            "groups": groups,
+            # .env 里的原值：空串 = 全部启用
+            "raw": envstore.raw_enabled_strategies(),
+        })
+
     def _api_settings_get(self) -> None:
         self._json({
             "ok": True,
@@ -1463,11 +1528,17 @@ class Handler(BaseHTTPRequestHandler):
     def _reload_settings(self) -> tuple[bool, str | None]:
         """改完 .env 之后让新配置在当前进程里生效。
 
-        必须做的三件事：重置 Settings 单例（它是进程级缓存）、丢掉缓存的
-        DataEngine（它把当时的 settings 存在自己身上）、清掉依赖配置的数据缓存。
+        必须做的几件事：重置 Settings 单例（它是进程级缓存）、丢掉缓存的
+        DataEngine（它把当时的 settings 存在自己身上）、清掉依赖配置的数据缓存、
+        以及作废缓存的选股结果。
+
+        最后一项是必须的：改了「启用哪些策略」之后，旧 signals 里可能还留着
+        已被禁用策略的结果（或缺少新启用策略的结果），不清就会让工作台显示出
+        一份与当前配置对不上的选股清单。
         """
         global _engine, _coverage_cache, _coverage_at
         global _dbstats_cache, _dbstats_at, _tasks_cache, _tasks_at
+        global _signals
 
         try:
             reset_settings()
@@ -1481,6 +1552,15 @@ class Handler(BaseHTTPRequestHandler):
             _coverage_cache, _coverage_at = None, 0.0
         _dbstats_cache, _dbstats_at = None, 0.0
         _tasks_cache, _tasks_at = None, 0.0
+
+        # 选股结果与「启用哪些策略」强相关，配置一变就作废（内存 + 磁盘缓存）
+        with _signals_lock:
+            _signals = None
+        try:
+            SIGNALS_CACHE.unlink(missing_ok=True)
+        except OSError as exc:  # noqa: PERF203
+            # 删不掉缓存不该让保存失败，只是下次仍会读到旧结果
+            log.warning(f"清理选股缓存失败（不影响配置已生效）：{exc}")
         return True, None
 
     def _api_settings_save(self, body: dict) -> None:

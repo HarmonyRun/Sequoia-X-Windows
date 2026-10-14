@@ -1973,6 +1973,20 @@ function renderSettings(reloadTasks) {
           extra: '<div id="set-llm-result"></div>'
         });
       }
+      if (g.key === 'strategies') {
+        // 策略勾选不走通用表单渲染。
+        // 通用表单只会渲染成「一个文本框，让你手填逗号分隔的 key」——那是给用户添麻烦。
+        // 这里画成分组勾选面板（中文名 + 说明 + 已启用计数）。
+        // 底层仍是同一个 ENABLED_STRATEGIES 配置项，所以面板自己负责往
+        // #set-f-ENABLED_STRATEGIES 这个隐藏 input 里同步值，这样
+        // recomputeDirty() / 保存栏 / applySettingsData() 一行都不用改就能生效。
+        return renderSettingGroup(g, {
+          actions: '<span class="hint">勾选后点右下角保存生效</span>',
+          extra: '<div id="set-strategy-picker" class="strategy-picker">'
+               +   '<div class="set-note info">正在读取策略列表…</div>'
+               + '</div>'
+        });
+      }
       return renderSettingGroup(g, {});
     }).join('') + (s.envPath ? '<div class="set-help">配置文件：' + esc(s.envPath) + '</div>' : '');
   }
@@ -2045,6 +2059,148 @@ function bindSettingsForm() {
   if (lbtn) {
     lbtn.addEventListener('click', function () { testLLM(lbtn); });
   }
+
+  // 策略勾选面板
+  renderStrategyPicker();
+}
+
+/* -------- 设置卡片：策略勾选 -------- */
+
+/** 策略勾选面板的状态（与后端 /api/strategies 同步） */
+const strategyState = { groups: [], total: 0, raw: '', loaded: false, error: '' };
+
+/**
+ * 读取 /api/strategies 并渲染勾选面板。
+ *
+ * 面板与 #set-f-ENABLED_STRATEGIES 隐藏 input 双向同步：
+ * 勾选框变化时把选中的 key 拼成逗号分隔字符串写进那个 input，
+ * 于是现有的 recomputeDirty() 就会把 ENABLED_STRATEGIES 标记为脏，
+ * 右下角保存栏自动出现。不需要给保存流程加任何特例。
+ */
+async function renderStrategyPicker(force) {
+  const box = $('#set-strategy-picker');
+  if (!box) return;
+
+  if (!strategyState.loaded || force) {
+    try {
+      const data = await api('/api/strategies');
+      strategyState.groups = data.groups || [];
+      strategyState.total = data.total || 0;
+      strategyState.raw = data.raw == null ? '' : String(data.raw);
+      strategyState.error = '';
+      strategyState.loaded = true;
+    } catch (e) {
+      strategyState.error = e.message;
+      box.innerHTML = noteHTML('err', '读取策略列表失败：' + e.message);
+      return;
+    }
+  }
+
+  renderStrategyPickerBody();
+}
+
+function renderStrategyPickerBody() {
+  const box = $('#set-strategy-picker');
+  if (!box) return;
+
+  const st = strategyState;
+  const enabledSet = {};
+  let enabledCount = 0;
+  st.groups.forEach(function (g) {
+    (g.items || []).forEach(function (it) {
+      if (it.enabled) { enabledSet[it.key] = true; enabledCount++; }
+    });
+  });
+
+  // 「全选/全不选」按钮 + 计数
+  let html = '<div class="sp-toolbar">'
+           +   '<span class="sp-count">已启用 <b>' + enabledCount + '</b> / ' + st.total + ' 个策略</span>'
+           +   '<span class="sp-actions">'
+           +     '<button type="button" class="btn btn-sm" id="sp-all">全选</button>'
+           +     '<button type="button" class="btn btn-sm" id="sp-none">全不选</button>'
+           +     '<button type="button" class="btn btn-sm" id="sp-reset">恢复默认（全部启用）</button>'
+           +   '</span>'
+           + '</div>';
+
+  if (enabledCount === 0) {
+    // 这个提示很重要：用户可能以为「一个都不勾 = 什么都不跑」，
+    // 实际上空配置的语义是「全部启用」（向后兼容老 .env）。
+    html += noteHTML('info',
+      '当前没有任何自定义：<b>留空 = 全部启用</b>。若真的一个策略都不想跑，请至少勾选一个。');
+  }
+
+  st.groups.forEach(function (g) {
+    html += '<div class="sp-group">'
+          +   '<div class="sp-group-title">' + esc(g.title) + '</div>'
+          +   '<div class="sp-grid">';
+    (g.items || []).forEach(function (it) {
+      html += '<label class="sp-item' + (it.enabled ? ' is-on' : '') + '" title="' + esc(it.desc || '') + '">'
+            +   '<input type="checkbox" data-sp="' + esc(it.key) + '"'
+            +     (it.enabled ? ' checked' : '') + '>'
+            +   '<span class="sp-label">' + esc(it.label) + '</span>'
+            +   '<code class="sp-key">' + esc(it.key) + '</code>'
+            + '</label>';
+    });
+    html += '</div></div>';
+  });
+
+  // 隐藏 input：让通用的脏检测/保存流程能读到值
+  html += '<input type="hidden" id="set-f-ENABLED_STRATEGIES" data-key="ENABLED_STRATEGIES" value="">';
+
+  box.innerHTML = html;
+
+  // 初始同步一次隐藏 input（此时还没改动，值等于已保存值，不会误报 dirty）
+  syncStrategyInput(false);
+
+  box.querySelectorAll('input[data-sp]').forEach(function (cb) {
+    cb.addEventListener('change', function () {
+      cb.closest('.sp-item').classList.toggle('is-on', cb.checked);
+      syncStrategyInput(true);
+    });
+  });
+
+  const all = $('#sp-all');
+  if (all) all.addEventListener('click', function () { setAllStrategies(true); });
+  const none = $('#sp-none');
+  if (none) none.addEventListener('click', function () { setAllStrategies(false); });
+  const reset = $('#sp-reset');
+  if (reset) reset.addEventListener('click', function () { setAllStrategies(true); });
+}
+
+/**
+ * 把勾选状态写进隐藏 input。
+ *
+ * @param {boolean} markDirty 是否触发脏检测。
+ *   初始化时必须传 false：那时 input 的值会被设成「用户上次保存的原值」，
+ *   而拿它去和基线比较正是我们想要的（相等 -> 不脏）。
+ *   但如果是用户点出来的，就必须触发 recomputeDirty() 让保存栏出现。
+ */
+function syncStrategyInput(markDirty) {
+  const input = $('#set-f-ENABLED_STRATEGIES');
+  if (!input) return;
+
+  const picked = [];
+  document.querySelectorAll('input[data-sp]').forEach(function (cb) {
+    if (cb.checked) picked.push(cb.getAttribute('data-sp'));
+  });
+
+  // 全部勾选时写空字符串——语义等价（空=全开），而且这样
+  // .env 里不会存一长串 15 个 key，将来新增策略也能自动生效。
+  input.value = picked.length === strategyState.total ? '' : picked.join(',');
+
+  // 更新计数与提示
+  const cnt = document.querySelector('.sp-count b');
+  if (cnt) cnt.textContent = picked.length;
+
+  if (markDirty) onSettingChangedNow();
+}
+
+function setAllStrategies(on) {
+  document.querySelectorAll('input[data-sp]').forEach(function (cb) {
+    cb.checked = on;
+    cb.closest('.sp-item').classList.toggle('is-on', on);
+  });
+  syncStrategyInput(true);
 }
 
 /* -------- 设置卡片：大模型连通性测试 -------- */

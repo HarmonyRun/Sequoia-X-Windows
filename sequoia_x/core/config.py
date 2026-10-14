@@ -20,6 +20,18 @@ class Settings(BaseSettings):
     #
     # 默认 auto 而不是 upstream 的 baostock：安装包分发给别人时要保证「装完就能用」，
     # 而 baostock 需要登录、且会拉黑高频请求的 IP；auto 在某个源不可用时会自动换源。
+    # 启用哪些选股策略（逗号分隔的策略 key）。
+    #
+    # 空字符串（默认）= 全部启用 —— 这是为了向后兼容：老用户的 .env 里没有这一项，
+    # 行为必须和以前完全一致（跑全部策略）。
+    #
+    # 一旦填了值，就只有列出的策略参与选股，其余不跑、不推送。
+    # 这个开关是**全局生效**的：命令行 main.py、Web 工作台手动触发、
+    # 以及每天 19:15 的计划任务都读同一个值，保证三处行为一致。
+    #
+    # 例：ENABLED_STRATEGIES=ma_volume,turtle,rps
+    enabled_strategies: str = ""
+
     data_source: str = "auto"
 
     # auto 模式下数据源的尝试顺序（逗号分隔）。

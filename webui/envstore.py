@@ -168,6 +168,26 @@ GROUPS: list[dict] = [
         ],
     },
     {
+        "key": "strategies",
+        "title": "选股策略",
+        "desc": "勾选参与选股的策略。不勾任何一项 = 全部启用（保持与升级前一致）。"
+                "这个开关是全局的：命令行、工作台手动触发、每天定时任务都读同一份配置。",
+        "items": [
+            {
+                "key": "ENABLED_STRATEGIES",
+                "label": "启用的策略",
+                "type": "text",
+                "required": False,
+                "default": "",
+                "placeholder": "留空 = 全部启用；或用逗号分隔，如 ma_volume,turtle,rps",
+                "help": "留空表示全部启用（向后兼容，升级后行为不变）。"
+                        "要只跑其中几个，就把它们的 key 用英文逗号隔开填进来；"
+                        "填了非法 key 会直接报错并列出所有可用 key，不会静默忽略。"
+                        "工作台的勾选面板走 /api/strategies，最终也是写这一项。",
+            },
+        ],
+    },
+    {
         "key": "llm",
         "title": "大模型分析（可选）",
         "desc": "开启后，每次跑完选股会把「当天的市场情况 + 各策略选出的股票」交给大模型分析，"
@@ -399,6 +419,54 @@ class SettingError(ValueError):
     """设置项校验失败。消息直接给用户看。"""
 
 
+def strategy_keys() -> list[str]:
+    """合法的策略 key 列表（= ``pipeline.STRATEGY_LABELS`` 的键）。
+
+    走**延迟导入**：``webui/envstore`` 被 ``server`` 导入的时间点很早，
+    顶层直接 import ``sequoia_x.pipeline`` 会连带把 15 个策略模块全拉起来。
+    延迟到真正校验/展示时再导入，既省启动时间，也避免设置页在极端情况下
+    因为某个策略模块导入失败而整个打不开。
+
+    导入失败时返回空列表 —— 调用方据此**跳过白名单校验**（宁可放过也不
+    要因为拿不到清单而把所有保存都拒掉）。
+    """
+    try:
+        from sequoia_x.pipeline import STRATEGY_LABELS
+    except Exception:  # noqa: BLE001
+        return []
+    return list(STRATEGY_LABELS.keys())
+
+
+def strategy_labels() -> dict[str, str]:
+    """``{key: 中文短名}``；拿不到时返回空字典。"""
+    try:
+        from sequoia_x.pipeline import STRATEGY_LABELS
+    except Exception:  # noqa: BLE001
+        return {}
+    return dict(STRATEGY_LABELS)
+
+
+def parse_enabled_strategies(value: str) -> list[str]:
+    """把 ``ENABLED_STRATEGIES`` 的原始字符串切成 key 列表。
+
+    逗号分隔，去空白、丢空项。**不判合法性**（合法判断在 ``validate_one``），
+    这里只负责切分，方便测试和复用。
+    """
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def raw_enabled_strategies() -> str:
+    """读取当前 ``ENABLED_STRATEGIES`` 的原值（空串 = 全部启用）。
+
+    供 ``/api/strategies`` 回显用，避免调用方去碰 ``_SPEC_BY_KEY`` 这类内部结构。
+    """
+    spec = _SPEC_BY_KEY.get("ENABLED_STRATEGIES")
+    if spec is None:
+        return ""
+    value, _in_file = current_value(spec[1], read_env())
+    return value
+
+
 def _clean(key: str, raw) -> str:
     if raw is None:
         return ""
@@ -457,6 +525,30 @@ def validate_one(key: str, raw) -> tuple[str, list[str]]:
             )
 
     # 跨字段/取值层面的提醒
+    if key == "ENABLED_STRATEGIES":
+        # 空字符串合法 = 全部启用（向后兼容）
+        keys = parse_enabled_strategies(value)
+        allowed = strategy_keys()
+        if keys and allowed:
+            unknown = [k for k in keys if k not in allowed]
+            if unknown:
+                # 拼错了必须报错而不是静默忽略，否则用户以为限制了、其实全跑
+                raise SettingError(
+                    f"「{label}」里有未知的策略：{', '.join(unknown)}。"
+                    f"可用的策略 key：{', '.join(allowed)}"
+                )
+        if len(keys) != len(set(keys)):
+            # 去重后写回，避免 .env 里出现重复 key
+            deduped = list(dict.fromkeys(keys))
+            warnings.append(f"「{label}」里有重复的策略，已去重：{', '.join(deduped)}")
+            value = ",".join(deduped)
+        else:
+            value = ",".join(keys)
+        if keys and allowed and len(keys) == len(allowed):
+            warnings.append(
+                f"「{label}」勾选了全部 {len(allowed)} 个策略，等价于留空；"
+                "要跑全部建议直接留空，以后新增策略时会自动带上"
+            )
     if key == "AK_WORKERS" and int(value) > 3:
         warnings.append(f"并发调到 {value} 容易被东方财富限流（实测 4 线程无间隔会触发硬限流）")
     if key == "DATA_SOURCE" and value == "baostock":

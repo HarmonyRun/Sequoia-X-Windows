@@ -692,6 +692,88 @@ select.set-input { cursor: pointer; }
 .set-note.info { border-color: rgba(88,166,255,.5); background: rgba(88,166,255,.07); color: #a5d6ff; }
 .set-note b { color: var(--text); }
 
+/* ── 策略勾选面板 ──────────────────────────────────────────────
+   设置页「选股策略」组专用。不走通用表单（那个只能渲染成一行文本框），
+   而是画成分组勾选网格：中文名 + key + 说明 tooltip。            */
+.strategy-picker { margin-top: 4px; }
+
+.sp-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.sp-count { color: var(--muted); font-size: 12.5px; }
+.sp-count b { color: var(--primary); font-size: 15px; margin: 0 2px; }
+.sp-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.sp-group { margin-top: 14px; }
+.sp-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 8px;
+  letter-spacing: .4px;
+}
+
+.sp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
+  gap: 8px;
+}
+
+/* 每项：勾选框 + 中文名 + key。用 label 包住，点哪儿都能切换 */
+.sp-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #21262d;
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+  min-width: 0;             /* 让内部文字能正常省略 */
+}
+.sp-item:hover { border-color: var(--muted-2); }
+.sp-item.is-on {
+  border-color: rgba(88,166,255,.55);
+  background: rgba(88,166,255,.08);
+}
+.sp-item input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  cursor: pointer;
+  margin: 0;
+}
+.sp-label {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-item.is-on .sp-label { color: var(--text); }
+.sp-key {
+  margin-left: auto;        /* key 推到最右，不跟中文名挤在一起 */
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted-2);
+  opacity: .75;
+  flex: 0 0 auto;
+}
+
+@media (max-width: 560px) {
+  .sp-grid { grid-template-columns: 1fr 1fr; }
+  .sp-key { display: none; }   /* 窄屏优先保证中文名可读 */
+}
+
 /* 数据源探测结果：源名 / 可用 / 耗时 */
 .probe-map { display: flex; flex-wrap: wrap; gap: 8px; }
 .probe-tag {
