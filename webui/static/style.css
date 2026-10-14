@@ -774,6 +774,160 @@ select.set-input { cursor: pointer; }
   .sp-key { display: none; }   /* 窄屏优先保证中文名可读 */
 }
 
+/* ── 自定义策略区（自然语言 → 规则）─────────────────────────────
+   挂在「选股策略」卡片下方：勾选决定用哪些策略，自定义决定再建哪些。 */
+.custom-area {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.cs-head h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 600;
+}
+.cs-desc {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+.cs-desc b { color: var(--text); }
+
+.cs-input-row { display: flex; gap: 8px; }
+.cs-input { flex: 1 1 auto; min-width: 0; }
+
+.cs-examples {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted-2);
+}
+.cs-example {
+  padding: 3px 9px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.cs-example:hover { border-color: var(--primary); color: var(--primary); }
+
+/* 草稿预览 */
+.cs-draft {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(88,166,255,.45);
+  border-radius: var(--radius);
+  background: rgba(88,166,255,.06);
+}
+.cs-draft-head {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--primary);
+  margin-bottom: 8px;
+}
+.cs-draft-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.cs-draft-meta b { color: var(--text); }
+.cs-retry { color: var(--warn); }
+.cs-draft-desc { font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
+.cs-samples {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.cs-samples code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--cyan);
+  margin-right: 6px;
+}
+.cs-details { margin-top: 10px; }
+.cs-details summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.cs-details summary:hover { color: var(--primary); }
+.cs-json {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--muted);
+  overflow-x: auto;
+  max-height: 320px;
+  white-space: pre;
+}
+.cs-draft-ops { margin-top: 12px; display: flex; gap: 8px; }
+
+/* 已保存列表 */
+.cs-list-head {
+  margin: 18px 0 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.cs-list { display: flex; flex-direction: column; gap: 8px; }
+.cs-item {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #21262d;
+}
+.cs-item.is-bad { border-color: rgba(210,153,34,.55); }
+.cs-item-main { flex: 1 1 auto; min-width: 0; }
+.cs-item-name {
+  font-size: 13px;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cs-badge {
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted-2);
+}
+.cs-item-desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.cs-item-meta { font-size: 11.5px; color: var(--muted-2); margin-top: 3px; }
+.cs-item-warn { font-size: 12px; color: var(--warn); margin-top: 4px; }
+.cs-item-ops { display: flex; gap: 6px; flex: 0 0 auto; }
+
+.btn-sm { padding: 3px 10px; font-size: 12px; }
+.btn-danger { border-color: rgba(248,81,73,.5); color: #ffb3ae; }
+.btn-danger:hover { border-color: var(--up); background: rgba(248,81,73,.1); }
+
+@media (max-width: 560px) {
+  .cs-input-row { flex-direction: column; }
+  .cs-item { flex-direction: column; }
+  .cs-item-ops { align-self: flex-end; }
+}
+
 /* 数据源探测结果：源名 / 可用 / 耗时 */
 .probe-map { display: flex; flex-wrap: wrap; gap: 8px; }
 .probe-tag {

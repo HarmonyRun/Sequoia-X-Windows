@@ -27,7 +27,7 @@ import traceback
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # ── 把仓库根目录加进 sys.path，并切到根目录（.env 与 data/ 都是相对路径） ──
 REPO = Path(__file__).resolve().parent.parent
@@ -47,6 +47,11 @@ from sequoia_x.pipeline import (  # noqa: E402
     run_strategies,
     strategy_meta,
 )
+from sequoia_x.strategy.custom.store import (  # noqa: E402
+    delete_rule as delete_custom_rule,
+    list_rules as list_custom_rules,
+    save_rule as save_custom_rule,
+)
 from webui import envstore  # noqa: E402
 
 # 策略分组的显示标题。分组的**成员和顺序**来自 pipeline.STRATEGY_GROUPS
@@ -54,6 +59,7 @@ from webui import envstore  # noqa: E402
 GROUP_TITLES: dict[str, str] = {
     "upstream": "原项目自带",
     "added": "本项目新增",
+    "custom": "自定义策略",
 }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -735,6 +741,28 @@ def save_signals(payload: dict) -> None:
     )
 
 
+def invalidate_signals(reason: str) -> bool:
+    """作废选股结果缓存（内存 + 磁盘），返回是否清掉了磁盘缓存。
+
+    什么时候要调：任何会让「已算出的 signals」不再对应现状的改动——改配置里的
+    启用策略（见 ``_reload_settings``）、增删自定义策略规则。自定义规则一改，
+    旧 signals 里那组 ``custom_*`` 结果就是按旧规则选出来的，不清就会让工作台
+    显示一份和当前规则对不上的选股清单。
+
+    删不掉磁盘缓存**不算失败**（Windows 上可能有别的东西占着文件），只是下次
+    仍会读到旧结果，所以记一条警告就好，不能因此让保存/删除操作报错。
+    """
+    global _signals
+    with _signals_lock:
+        _signals = None
+    try:
+        SIGNALS_CACHE.unlink(missing_ok=True)
+        return True
+    except OSError as exc:  # noqa: PERF203
+        log.warning(f"清理选股缓存失败（{reason}）：{exc}")
+        return False
+
+
 def enrich_groups(groups: list[dict]) -> list[dict]:
     """给信号里的代码补上中文名称和板块。"""
     names = get_name_map()
@@ -1149,6 +1177,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_coverage(q)
             if path == "/api/strategies":
                 return self._api_strategies_get()
+            if path == "/api/custom-strategies":
+                return self._api_custom_list()
             if path == "/api/signals":
                 return self._api_signals()
             if path == "/api/search":
@@ -1197,6 +1227,12 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/jobs":
                 return self._api_start_job(body)
+            # 注意顺序：generate 必须排在 /api/custom-strategies 之前判断，
+            # 否则（用 startswith 匹配时）会被更宽的路径吃掉
+            if parsed.path == "/api/custom-strategies/generate":
+                return self._api_custom_generate(body)
+            if parsed.path == "/api/custom-strategies":
+                return self._api_custom_save(body)
             if parsed.path == "/api/settings":
                 return self._api_settings_save(body)
             if parsed.path == "/api/settings/test-feishu":
@@ -1215,6 +1251,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(f"未知接口：{parsed.path}", 404)
         except Exception as exc:  # noqa: BLE001
             log.exception("POST 处理失败")
+            try:
+                self._error(f"{type(exc).__name__}: {exc}", 500)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        """删除类操作。目前只有「删除一条自定义策略」。
+
+        策略名是中文，浏览器会把它 URL 编码（%E7%BC%A9...），所以必须
+        ``unquote`` 解码后再拿去匹配——直接拿原始路径段比会永远 404。
+        """
+        try:
+            path = urlparse(self.path).path
+            prefix = "/api/custom-strategies/"
+            if path.startswith(prefix):
+                name = unquote(path[len(prefix):]).strip()
+                return self._api_custom_delete(name)
+            return self._error(f"未知接口：{path}", 404)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("DELETE 处理失败")
             try:
                 self._error(f"{type(exc).__name__}: {exc}", 500)
             except Exception:  # noqa: BLE001
@@ -1517,8 +1573,117 @@ class Handler(BaseHTTPRequestHandler):
             "raw": envstore.raw_enabled_strategies(),
         })
 
-    def _api_settings_get(self) -> None:
+    # ── 自定义策略（自然语言 → 规则） ──
+
+    def _api_custom_list(self) -> None:
+        """列出全部自定义策略。
+
+        ``store.list_rules()`` 已经算好了 ``warnings``（规则失效时里面带错误
+        信息），这里原样透传，前端直接展示即可。
+        """
+        try:
+            items = list_custom_rules()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("读取自定义策略失败")
+            return self._error(f"读取自定义策略失败：{type(exc).__name__}: {exc}", 500)
+        self._json({"ok": True, "total": len(items), "items": items})
+
+    def _api_custom_generate(self, body: dict) -> None:
+        """用自然语言生成规则草稿（**不保存**，让用户先预览确认）。
+
+        必须把 ``engine`` 传进 ``generate_rule``：传了才会抽样试跑，响应里
+        才带 ``dry_run``（大概能选出多少只），用户预览时才知道这条规则靠不靠谱。
+
+        ⚠️ 这个接口很慢是正常的：一次大模型调用 + 试跑 120 只股票，通常
+        30~90 秒，前端会显示「生成中」。这里的超时由大模型调用自己控制
+        （``rulegen`` 内部用 120 秒），HTTP 层不额外设限。
+        """
+        from sequoia_x.analyze.rulegen import GenerateError, generate_rule
+
+        description = body.get("description")
+        if not isinstance(description, str) or not description.strip():
+            return self._error("请先用中文描述你想要什么样的股票")
+
+        try:
+            settings = get_settings()
+        except Exception as exc:  # noqa: BLE001
+            return self._error(f"读取配置失败：{type(exc).__name__}: {exc}", 500)
+
+        # 引擎拿不到不该让整个生成失败：没有 engine 只是不试跑（dry_run=None），
+        # 大模型那一步仍然有价值，所以降级而不是报错。
+        try:
+            engine = get_engine()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"数据引擎不可用，本次生成跳过试跑：{exc}")
+            engine = None
+
+        log.info(f"生成自定义策略规则：{description.strip()[:60]}（试跑={'是' if engine else '否'}）")
+        try:
+            result = generate_rule(settings, description, engine=engine)
+        except GenerateError as exc:
+            # 消息是给用户看的（「还没有配置大模型…」/「请先用中文描述…」）
+            return self._error(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("生成规则失败")
+            return self._error(f"生成失败：{type(exc).__name__}: {exc}", 500)
+
+        rule = result.get("rule") or {}
+        log.info(f"规则生成成功：{rule.get('name')}（第 {result.get('attempts')} 次尝试）")
         self._json({
+            "ok": True,
+            # 只返回草稿，不落盘；用户确认后前端再调 POST /api/custom-strategies
+            "rule": rule,
+            "warnings": result.get("warnings") or [],
+            "attempts": result.get("attempts"),
+            "dry_run": result.get("dry_run"),
+        })
+
+    def _api_custom_save(self, body: dict) -> None:
+        """保存一条规则（用户预览确认后调）。
+
+        保存后必须作废选股缓存：自定义规则变了，之前算出来的 custom 组结果
+        就不对应现在的规则了——和改 ENABLED_STRATEGIES 同一个道理。
+        """
+        from sequoia_x.strategy.custom.evaluator import RuleError
+
+        rule = body.get("rule")
+        if not isinstance(rule, dict) or not rule:
+            return self._error("没有收到规则内容（缺少 rule 字段）")
+
+        source = str(body.get("source") or "manual").strip() or "manual"
+        if source not in ("llm", "manual"):
+            return self._error(f"来源只能是 llm 或 manual，收到 {source!r}")
+
+        try:
+            item = save_custom_rule(rule, source=source)
+        except RuleError as exc:
+            return self._error(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("保存自定义策略失败")
+            return self._error(f"保存失败：{type(exc).__name__}: {exc}", 500)
+
+        invalidate_signals("保存自定义策略")
+        log.info(f"自定义策略已保存：{item.get('name')}（来源 {source}）")
+        self._json({"ok": True, "item": item})
+
+    def _api_custom_delete(self, name: str) -> None:
+        """删除一条规则。``name`` 已经由 do_DELETE 做过 URL 解码。"""
+        if not name:
+            return self._error("没有指定要删除的策略名")
+        try:
+            deleted = delete_custom_rule(name)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("删除自定义策略失败")
+            return self._error(f"删除失败：{type(exc).__name__}: {exc}", 500)
+
+        if not deleted:
+            return self._error(f"没有这条自定义策略：{name}", 404)
+
+        invalidate_signals("删除自定义策略")
+        log.info(f"自定义策略已删除：{name}")
+        self._json({"ok": True, "deleted": True, "name": name})
+
+    def _api_settings_get(self) -> None:        self._json({
             "ok": True,
             "env_path": str(envstore.ENV_PATH),
             "groups": envstore.build_groups(),
@@ -1538,7 +1703,6 @@ class Handler(BaseHTTPRequestHandler):
         """
         global _engine, _coverage_cache, _coverage_at
         global _dbstats_cache, _dbstats_at, _tasks_cache, _tasks_at
-        global _signals
 
         try:
             reset_settings()
@@ -1554,13 +1718,7 @@ class Handler(BaseHTTPRequestHandler):
         _tasks_cache, _tasks_at = None, 0.0
 
         # 选股结果与「启用哪些策略」强相关，配置一变就作废（内存 + 磁盘缓存）
-        with _signals_lock:
-            _signals = None
-        try:
-            SIGNALS_CACHE.unlink(missing_ok=True)
-        except OSError as exc:  # noqa: PERF203
-            # 删不掉缓存不该让保存失败，只是下次仍会读到旧结果
-            log.warning(f"清理选股缓存失败（不影响配置已生效）：{exc}")
+        invalidate_signals("配置变更")
         return True, None
 
     def _api_settings_save(self, body: dict) -> None:

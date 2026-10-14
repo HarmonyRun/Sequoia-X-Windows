@@ -1980,11 +1980,16 @@ function renderSettings(reloadTasks) {
         // 底层仍是同一个 ENABLED_STRATEGIES 配置项，所以面板自己负责往
         // #set-f-ENABLED_STRATEGIES 这个隐藏 input 里同步值，这样
         // recomputeDirty() / 保存栏 / applySettingsData() 一行都不用改就能生效。
+        //
+        // 同组下方还挂「自定义策略」区块：两者是同一件事的两半
+        // （勾选决定用哪些内置策略，自定义决定再建哪些自己的策略），
+        // 放一起用户不用来回翻。
         return renderSettingGroup(g, {
           actions: '<span class="hint">勾选后点右下角保存生效</span>',
           extra: '<div id="set-strategy-picker" class="strategy-picker">'
                +   '<div class="set-note info">正在读取策略列表…</div>'
                + '</div>'
+               + '<div id="custom-strategy-area" class="custom-area"></div>'
         });
       }
       return renderSettingGroup(g, {});
@@ -2062,6 +2067,291 @@ function bindSettingsForm() {
 
   // 策略勾选面板
   renderStrategyPicker();
+  // 自定义策略区块
+  renderCustomArea();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   自定义策略：自然语言描述 → 大模型翻译成规则 → 预览确认 → 保存
+   ═══════════════════════════════════════════════════════════════ */
+
+/** 自定义策略区的状态 */
+const customState = {
+  items: [],
+  loaded: false,
+  busy: false,      // 正在生成 / 保存
+  draft: null,      // 待确认的草稿 {rule, warnings, attempts, dry_run}
+  draftError: '',
+};
+
+const CUSTOM_EXAMPLES = [
+  '找连续三天缩量回调、今天放量收阳的票',
+  '5日线上穿20日线并且放量的',
+  '创业板里 RSI 超卖后开始回升的',
+  '突破20日新高并且成交量放大1.5倍的',
+];
+
+async function renderCustomArea(force) {
+  const box = $('#custom-strategy-area');
+  if (!box) return;
+
+  if (!customState.loaded || force) {
+    try {
+      const data = await api('/api/custom-strategies');
+      customState.items = data.items || [];
+      customState.loaded = true;
+    } catch (e) {
+      // 接口可能还没上线（后端在并行开发），不要因此把整个设置页搞崩
+      customState.items = [];
+      customState.loaded = true;
+      customState.loadError = e.message;
+    }
+  }
+  renderCustomAreaBody();
+}
+
+function renderCustomAreaBody() {
+  const box = $('#custom-strategy-area');
+  if (!box) return;
+  const st = customState;
+
+  let html = '<div class="cs-head">'
+           +   '<h3>自定义策略</h3>'
+           +   '<p class="cs-desc">用中文描述你想要什么样的股票，大模型会把它翻译成选股规则。'
+           +   '生成后<b>先预览确认再保存</b>——大模型偶尔会理解错，规则是给人看懂的格式，你可以直接改。</p>'
+           + '</div>';
+
+  // ── 输入区 ──
+  html += '<div class="cs-input-row">'
+        +   '<input type="text" id="cs-desc" class="input cs-input" '
+        +     'placeholder="例如：找连续三天缩量回调、今天放量收阳的票" '
+        +     (st.busy ? 'disabled' : '') + '>'
+        +   '<button type="button" class="btn btn-primary" id="cs-generate" '
+        +     (st.busy ? 'disabled' : '') + '>'
+        +     (st.busy ? '生成中…' : '生成规则')
+        +   '</button>'
+        + '</div>';
+
+  if (!st.busy) {
+    html += '<div class="cs-examples">试试：'
+          + CUSTOM_EXAMPLES.map(function (t) {
+              return '<button type="button" class="cs-example" data-example="' + esc(t) + '">'
+                   + esc(t) + '</button>';
+            }).join('')
+          + '</div>';
+  }
+
+  if (st.busy) {
+    html += noteHTML('info',
+      '正在调用大模型翻译，并试跑一批股票验证效果，通常需要 30~90 秒…');
+  }
+
+  if (st.draftError) {
+    html += noteHTML('err', '生成失败：' + esc(st.draftError));
+  }
+
+  // ── 草稿预览区 ──
+  if (st.draft) {
+    html += renderDraft(st.draft);
+  }
+
+  // ── 已保存列表 ──
+  html += '<div class="cs-list-head">已保存的自定义策略（'
+        + st.items.length + ' 条）</div>';
+
+  if (!st.items.length) {
+    html += emptyBox('还没有自定义策略。上面输入一句话就能建一个。', true);
+  } else {
+    html += '<div class="cs-list">';
+    st.items.forEach(function (it) {
+      const bad = (it.warnings || []).length > 0;
+      html += '<div class="cs-item' + (bad ? ' is-bad' : '') + '">'
+            +   '<div class="cs-item-main">'
+            +     '<div class="cs-item-name">' + esc(it.name)
+            +       '<span class="cs-badge">' + esc(it.source === 'llm' ? '大模型生成' : '手动') + '</span>'
+            +     '</div>'
+            +     (it.description ? '<div class="cs-item-desc">' + esc(it.description) + '</div>' : '')
+            +     '<div class="cs-item-meta">更新于 ' + esc(it.updated_at || '--') + '</div>'
+            +     (bad ? '<div class="cs-item-warn">' + esc(it.warnings.join('；')) + '</div>' : '')
+            +   '</div>'
+            +   '<div class="cs-item-ops">'
+            +     '<button type="button" class="btn btn-sm" data-cs-view="' + esc(it.name) + '">看规则</button>'
+            +     '<button type="button" class="btn btn-sm btn-danger" data-cs-del="' + esc(it.name) + '">删除</button>'
+            +   '</div>'
+            +   '<pre class="cs-json" id="cs-json-' + esc(cssId(it.name)) + '" hidden></pre>'
+            + '</div>';
+    });
+    html += '</div>';
+  }
+
+  box.innerHTML = html;
+  bindCustomArea();
+
+  // 「看规则」点击后把 JSON 填进对应的 pre
+  st.items.forEach(function (it) {
+    const pre = $('#cs-json-' + cssId(it.name));
+    if (pre) pre.textContent = JSON.stringify(it.conditions, null, 2);
+  });
+}
+
+/** 把名字转成能安全用作 id 的字符串（中文名不能直接进 querySelector） */
+function cssId(name) {
+  return String(name).replace(/[^0-9a-zA-Z]/g, function (c) {
+    return 'u' + c.charCodeAt(0).toString(16);
+  });
+}
+
+function renderDraft(d) {
+  const rule = d.rule || {};
+  const dry = d.dry_run || {};
+  let html = '<div class="cs-draft">';
+  html += '<div class="cs-draft-head">规则已生成，请确认</div>';
+
+  html += '<div class="cs-draft-meta">'
+        +   '<span>策略名：<b>' + esc(rule.name || '(未命名)') + '</b></span>'
+        +   (d.attempts > 1 ? '<span class="cs-retry">重试了 ' + d.attempts + ' 次才通过校验</span>' : '')
+        + '</div>';
+
+  if (rule.description) {
+    html += '<div class="cs-draft-desc">' + esc(rule.description) + '</div>';
+  }
+
+  // 试跑结果：让用户有个「大概能选出多少只」的预期
+  if (dry.checked) {
+    const rate = dry.checked ? (dry.hits / dry.checked * 100) : 0;
+    let kind = 'ok';
+    let msg = '试跑 ' + dry.checked + ' 只股票，命中 <b>' + dry.hits + '</b> 只'
+            + '（约 ' + rate.toFixed(1) + '%）';
+    if (dry.hits === 0) {
+      kind = 'warn';
+      msg += '，全市场大概也选不出多少只。条件可能过严，建议放宽某个数值后重试。';
+    } else if (rate > 30) {
+      kind = 'warn';
+      msg += '，比例偏高，条件可能偏松。';
+    }
+    html += noteHTML(kind, msg);
+    if (dry.samples && dry.samples.length) {
+      html += '<div class="cs-samples">命中样例：'
+            + dry.samples.map(function (c) { return '<code>' + esc(c) + '</code>'; }).join(' ')
+            + '</div>';
+    }
+  }
+
+  if ((d.warnings || []).length) {
+    html += noteHTML('warn', d.warnings.map(esc).join('；'));
+  }
+
+  html += '<details class="cs-details"><summary>查看生成的规则 JSON（可复制去改）</summary>'
+        +   '<pre class="cs-json">' + esc(JSON.stringify(rule, null, 2)) + '</pre>'
+        + '</details>';
+
+  html += '<div class="cs-draft-ops">'
+        +   '<button type="button" class="btn btn-primary" id="cs-save">保存这个策略</button>'
+        +   '<button type="button" class="btn" id="cs-discard">放弃</button>'
+        + '</div>';
+  html += '</div>';
+  return html;
+}
+
+function bindCustomArea() {
+  const input = $('#cs-desc');
+  if (input) {
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); doGenerateRule(); }
+    });
+  }
+
+  const gen = $('#cs-generate');
+  if (gen) gen.addEventListener('click', doGenerateRule);
+
+  document.querySelectorAll('[data-example]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const el = $('#cs-desc');
+      if (el) { el.value = btn.getAttribute('data-example'); el.focus(); }
+    });
+  });
+
+  const save = $('#cs-save');
+  if (save) save.addEventListener('click', doSaveDraft);
+
+  const discard = $('#cs-discard');
+  if (discard) discard.addEventListener('click', function () {
+    customState.draft = null;
+    customState.draftError = '';
+    renderCustomAreaBody();
+  });
+
+  document.querySelectorAll('[data-cs-view]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const pre = $('#cs-json-' + cssId(btn.getAttribute('data-cs-view')));
+      if (pre) pre.hidden = !pre.hidden;
+    });
+  });
+
+  document.querySelectorAll('[data-cs-del]').forEach(function (btn) {
+    btn.addEventListener('click', function () { doDeleteRule(btn.getAttribute('data-cs-del')); });
+  });
+}
+
+async function doGenerateRule() {
+  const input = $('#cs-desc');
+  const desc = input ? String(input.value || '').trim() : '';
+  if (!desc) {
+    showToast('先用中文描述一下你想要什么样的股票', 'err');
+    return;
+  }
+  customState.busy = true;
+  customState.draftError = '';
+  customState.draft = null;
+  renderCustomAreaBody();
+
+  try {
+    // 注意：api() 直接透传 options 给 fetch，没有 timeoutMs 这种东西。
+    // 这个接口要调大模型 + 试跑 120 只股票，30~90 秒很正常；
+    // fetch 默认不超时，所以这里不需要额外配置，只要界面上把「生成中」显示出来。
+    const data = await api('/api/custom-strategies/generate', {
+      method: 'POST', body: { description: desc },
+    });
+    customState.draft = data;
+    showToast('规则生成成功，请确认后保存', 'ok');
+  } catch (e) {
+    customState.draftError = e.message;
+  } finally {
+    customState.busy = false;
+    renderCustomAreaBody();
+  }
+}
+
+async function doSaveDraft() {
+  const d = customState.draft;
+  if (!d || !d.rule) return;
+  try {
+    await api('/api/custom-strategies', {
+      method: 'POST', body: { rule: d.rule, source: 'llm' },
+    });
+    customState.draft = null;
+    customState.loaded = false;
+    showToast('已保存。记得在上面勾选「自定义策略」并保存设置，它才会参与选股', 'ok');
+    await renderCustomArea(true);
+    // 新策略可能改变策略总数，刷新勾选面板的计数
+    strategyState.loaded = false;
+    await renderStrategyPicker(true);
+  } catch (e) {
+    showError('保存失败：' + e.message);
+  }
+}
+
+async function doDeleteRule(name) {
+  if (!window.confirm('确定删除自定义策略「' + name + '」？此操作不可撤销。')) return;
+  try {
+    await api('/api/custom-strategies/' + encodeURIComponent(name), { method: 'DELETE' });
+    showToast('已删除「' + name + '」', 'ok');
+    await renderCustomArea(true);
+    strategyState.loaded = false;
+    await renderStrategyPicker(true);
+  } catch (e) {
+    showError('删除失败：' + e.message);
+  }
 }
 
 /* -------- 设置卡片：策略勾选 -------- */
