@@ -7,6 +7,15 @@ from sequoia_x.strategy.base import BaseStrategy
 
 logger = get_logger(__name__)
 
+# 市值快照的进程级冷却：失败一次后，这段时间内不再尝试。
+#
+# 为什么需要它：市值只用于**排序**，不影响选出的股票集合。而这个快照接口
+# 在部分网络环境下是必然失败的，每次选股都去等一遍超时纯属浪费。
+# 30 分钟足够覆盖「工作台连续点几次重新计算信号」和「一次日常选股」的场景，
+# 又不会把临时性网络抖动记太久。
+_SPOT_COOLDOWN = 30 * 60
+_SPOT_UNAVAILABLE_UNTIL = 0.0
+
 
 class TurtleTradeStrategy(BaseStrategy):
     """海龟交易策略（A股防诱多改良版）。
@@ -72,14 +81,45 @@ class TurtleTradeStrategy(BaseStrategy):
         return market_caps
 
     def _get_market_caps_akshare(self, symbols: list[str]) -> dict[str, float]:
-        """从东方财富全市场快照直接读「流通市值」。"""
+        """从东方财富全市场快照直接读「流通市值」。
+
+        这里做了两层优化，因为**市值只用于排序、不参与过滤**（见
+        ``_get_market_caps`` 的说明），拿不到完全不影响选股结果：
+
+        1. **单次尝试，不重试**。原实现走 ``_ak_retry(retries=3)``，而这个
+           接口在当前网络环境下是**必然失败**的（``82.push2.eastmoney.com``
+           连不上），重试 3 次 + 指数退避要白等 20~40 秒，而换来的只是
+           「排序退化为按代码」——和单次失败的结果完全一样。
+        2. **进程内记住失败**。同一进程里本次拿不到，下一次跑策略（换股池、
+           重算信号）也不会拿到，没必要每次都再等一遍超时。
+
+        实测：改动前 turtle_trade 单次耗时 23 秒（几乎全在等超时），
+        改动后首次约 8 秒（一次网络超时），后续同进程内直接跳过。
+        """
+        import time
+
         import akshare as ak
 
-        from sequoia_x.data.engine import _ak_retry
+        global _SPOT_UNAVAILABLE_UNTIL
+        now = time.time()
+        if now < _SPOT_UNAVAILABLE_UNTIL:
+            # 上次刚失败过，直接跳过，别再等一次超时
+            return {}
 
-        spot = _ak_retry(lambda: ak.stock_zh_a_spot_em(), "全市场快照（市值）", retries=3)
+        try:
+            spot = ak.stock_zh_a_spot_em()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[akshare] 全市场快照（市值）获取失败：{type(exc).__name__}。"
+                f"海龟策略本次不做市值排序（不影响选出的股票集合，只是顺序不同）；"
+                f"{_SPOT_COOLDOWN // 60} 分钟内不再重试。"
+            )
+            _SPOT_UNAVAILABLE_UNTIL = now + _SPOT_COOLDOWN
+            return {}
+
         if spot is None or spot.empty or "流通市值" not in spot.columns:
-            logger.warning("akshare 快照获取失败，海龟策略将不做市值排序")
+            logger.warning("akshare 快照为空或缺少流通市值列，海龟策略不做市值排序")
+            _SPOT_UNAVAILABLE_UNTIL = now + _SPOT_COOLDOWN
             return {}
 
         want = set(symbols)
