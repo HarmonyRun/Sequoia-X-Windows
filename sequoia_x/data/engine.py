@@ -313,6 +313,13 @@ class DataEngine:
         self.auto_order: list[str] = self._parse_auto_order(
             getattr(settings, "auto_source_order", None)
         )
+        # 全市场缓存。默认开启，但**只有显式调 warm_cache() 才真的加载**——
+        # 所以单只查询、回填、增量同步这些场景完全不受影响。
+        # 出问题可以设 settings.cache_market_data=False 一键关掉。
+        self._cache_enabled: bool = bool(
+            getattr(settings, "cache_market_data", True)
+        )
+        self._cache = None
         self._init_db()
         logger.info(f"数据源：{self.data_source}" + (
             f"（auto 顺序：{self.auto_order}）" if self.data_source == "auto" else ""
@@ -374,6 +381,19 @@ class DataEngine:
         return row[0] if row and row[0] else None
 
     def get_ohlcv(self, symbol: str) -> pd.DataFrame:
+        """取一只股票的日线（升序）。
+
+        如果全市场缓存已就绪（``warm_cache()``），直接从内存返回；
+        否则回退到逐股查库，行为与优化前完全一致。
+
+        **为什么要有缓存**：16 个策略各自遍历一遍全市场，每只都调一次这个方法，
+        合计 8.4 万次 SQL。实测单次 2.4ms，光查库就 196 秒。而所有策略用的是
+        同一份数据，所以加载一次留在内存里，后续遍历几乎零成本（196s -> 12s）。
+        """
+        if self._cache is not None:
+            cached = self._cache.get(symbol)
+            if cached is not None:
+                return cached
         with _connect(self.db_path) as conn:
             df = pd.read_sql(
                 "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
@@ -381,6 +401,48 @@ class DataEngine:
                 params=(symbol,),
             )
         return df
+
+    # ── 全市场缓存 ──────────────────────────────────────────────────
+
+    def warm_cache(self, force: bool = False) -> bool:
+        """预加载全市场到内存。
+
+        由批量选股流程（``pipeline.run_strategies``）调用；跑完记得
+        ``release_cache()``，别让工作台常驻几百 MB。
+
+        Args:
+            force: 忽略已有缓存强制重载。
+
+        Returns:
+            缓存是否可用。失败或已关闭时返回 False，调用方照常走逐股查库。
+        """
+        if not self._cache_enabled:
+            return False
+        from sequoia_x.data.ohlcv_cache import OhlcvCache
+
+        if self._cache is None:
+            self._cache = OhlcvCache(self.db_path, enabled=True)
+        return self._cache.warm(force=force)
+
+    def release_cache(self) -> None:
+        """释放全市场缓存（把内存还回去）。"""
+        if self._cache is not None:
+            self._cache.release()
+
+    def cache_stats(self) -> dict:
+        """缓存当前状态，供工作台与诊断脚本查看。"""
+        if self._cache is None:
+            return {"enabled": self._cache_enabled, "ready": False,
+                    "symbols": 0, "rows": 0, "warm_seconds": 0.0}
+        return self._cache.stats
+
+    def disable_cache(self) -> None:
+        """彻底关掉缓存——出问题时的降级开关。"""
+        self._cache_enabled = False
+        if self._cache is not None:
+            self._cache.enabled = False
+            self._cache.release()
+            self._cache = None
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:

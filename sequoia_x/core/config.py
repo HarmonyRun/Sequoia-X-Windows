@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     # 例：ENABLED_STRATEGIES=ma_volume,turtle,rps
     enabled_strategies: str = ""
 
+    # 批量选股时是否预加载全市场数据到内存。
+    #
+    # 为什么需要：16 个策略各自遍历一遍全市场，每只都查一次数据库，
+    # 合计 8.4 万次 SQL，光查库就要 196 秒。而所有策略用的是同一份数据，
+    # 加载一次留在内存后总耗时降到约 12 秒（实测）。
+    #
+    # 代价：一次性约 341 MB 内存（用完即释放，不常驻）。
+    # 如果机器内存紧张，或者怀疑缓存导致数据不是最新的，设成 false 即可
+    # 退回逐股查库——选股结果完全一样，只是慢。
+    cache_market_data: bool = True
+
     data_source: str = "auto"
 
     # auto 模式下数据源的尝试顺序（逗号分隔）。
